@@ -390,3 +390,14 @@ def test_degraded_drift_search_warns_and_reports_what_it_covered(caplog):
     assert "Drift search degraded" in caplog.text
     assert searched_drift_hz_s(16, 64, tsamp, foff_mhz, 4.0) == pytest.approx(4 * 0.15306, rel=1e-3)
     assert searched_drift_hz_s(16, 65536, tsamp, foff_mhz, 4.0) == 4.0, "a full window covers it all"
+
+
+def test_model_trained_for_other_classes_is_reported_not_crashing(tmp_path):
+    """A model with a different class list misaligned every p_* column and crashed each unit."""
+    import joblib
+
+    path = tmp_path / "old.joblib"
+    joblib.dump({"model": object(), "meta": {"labels": ["technosignature_like", "noise"]}}, path)
+    scorer = HitScorer(path)
+    assert not scorer.available and "differ" in scorer.load_error
+    assert np.isnan(scorer.predict(np.zeros((2, 3)))).all()

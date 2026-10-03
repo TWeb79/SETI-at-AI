@@ -49,7 +49,12 @@ def _sklearn_version() -> str:
         return "not installed"
 
 
-def _training_example(kind: str, rng, n_time=16, n_chan=4096, max_drift=6.0):
+# Production drift range on GBT high-res data: 4 Hz/s is ~26 channels/step, capped at
+# max_drift_ch_per_step = 32. Training only up to 6 left the classifier guessing (B3).
+TRAIN_MAX_DRIFT = 32.0
+
+
+def _training_example(kind: str, rng, n_time=16, n_chan=4096, max_drift=TRAIN_MAX_DRIFT):
     from ..dsp.dedoppler import drift_search
     from ..dsp.preprocess import normalize
     data = noise_waterfall(n_time, n_chan, rng, bandpass=True)
@@ -111,10 +116,23 @@ def train(n_per_class: int = 400, seed: int = 0, out: Path = DEFAULT_MODEL, prog
     clf = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.08,
                                          early_stopping=True, random_state=seed)
     clf.fit(xtr, ytr)
-    acc = float((clf.predict(xte) == yte).mean())
+    pred = clf.predict(xte)
+    acc = float((pred == yte).mean())
+    # B3: report accuracy as a function of drift, so a gap in the training range shows up.
+    drift = np.abs(xte[:, SCALAR_FEATURES.index("abs_drift_ch")])
+    et = LABELS.index("technosignature_like")
+    by_drift = {}
+    for lo, hi in ((0, 1), (1, 4), (4, 12), (12, TRAIN_MAX_DRIFT + 1)):
+        band = (drift >= lo) & (drift < hi)
+        et_band = band & (yte == et)
+        by_drift[f"{lo}-{hi:g} ch/step"] = {
+            "n": int(band.sum()),
+            "accuracy": round(float((pred[band] == yte[band]).mean()), 3) if band.any() else None,
+            "et_recall": round(float((pred[et_band] == et).mean()), 3) if et_band.any() else None}
     from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(yte, clf.predict(xte), labels=range(len(LABELS))).tolist()
     meta = {"labels": LABELS, "scalar_features": SCALAR_FEATURES, "test_accuracy": acc,
+            "accuracy_by_drift": by_drift, "train_max_drift_ch": TRAIN_MAX_DRIFT,
             "confusion_matrix": cm, "n_train": len(ytr), "train_seconds": time.time() - t0,
             "snr_max": float(x[:, SCALAR_FEATURES.index("snr")].max()),
             "class_counts": {lab: int((y == i).sum()) for i, lab in enumerate(LABELS)},
@@ -148,6 +166,10 @@ class HitScorer:
                 import joblib
                 bundle = joblib.load(self.path)
                 self.model, self.meta = bundle["model"], bundle["meta"]
+                if list(self.meta.get("labels", LABELS)) != list(LABELS):
+                    # A model trained for other classes would misalign every probability column.
+                    raise ValueError(f"model classes {self.meta.get('labels')} differ from this "
+                                     f"version's {LABELS}; run `ai-seti train`")
             except Exception as exc:   # version mismatch etc. — degrade, but say so
                 self.model = None
                 self.load_error = f"{type(exc).__name__}: {exc}"

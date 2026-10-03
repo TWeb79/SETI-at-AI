@@ -73,6 +73,41 @@ def drift_resolvable(header: FilterbankHeader, cfg: SearchConfig) -> bool:
     return not foff_hz or cfg.max_drift_rate_hz_s * header.nsamples * header.tsamp >= foff_hz
 
 
+_SCAN_NAME = re.compile(r"guppi_(\d{5})_(\d{5})_(.+)_\d{4}\.gpuspec\.(.+)$")
+
+
+def cadence_siblings(url: str) -> list[dict]:
+    """All scans of the cadence `url` belongs to, in time order, with their ON/OFF role.
+
+    The archive's query rows have no cadence link (backlog B7), but every scan of one cadence
+    sits in the same folder (e.g. `LHS1140/C/`), and the folder listing names them all. The
+    same product (`.0000`, `.0002`, ...) is kept, and the ON target is the one observed more
+    than once (the ABACAD pattern). Returns [] if the folder can't be read or isn't a cadence.
+    """
+    folder, name = url.rsplit("/", 1)
+    m = _SCAN_NAME.search(name)
+    if not m:
+        return []
+    product = m.group(4)
+    try:
+        body, _, _ = remote._get(folder + "/", timeout=30, retries=1)
+    except Exception:   # listing unavailable: no cadence, never a crash
+        return []
+    scans = []
+    for fname in sorted(set(re.findall(r'href="([^"/?]+\.fil)"', body.decode("utf-8", "replace")))):
+        sm = _SCAN_NAME.search(fname)
+        if sm and sm.group(4) == product:
+            scans.append({"url": f"{folder}/{fname}", "target": sm.group(3),
+                          "mjd": int(sm.group(1)) + int(sm.group(2)) / 86400.0, "kind": "remote"})
+    targets = [s["target"] for s in scans]
+    on = max(set(targets), key=targets.count) if targets else None
+    if on is None or targets.count(on) < 2 or len(set(targets)) < 2:
+        return []
+    for s in scans:
+        s["is_on"] = s["target"] == on
+    return sorted(scans, key=lambda s: s["mjd"])
+
+
 def unit_too_large(header: FilterbankHeader, cfg: SearchConfig) -> str | None:
     """Why one work unit of this file would not fit in memory, or None if it does.
 

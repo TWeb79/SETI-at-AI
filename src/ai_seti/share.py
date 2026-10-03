@@ -59,7 +59,9 @@ def _clean(v):
 
 def _cadence_status(row: pd.Series, events: pd.DataFrame | None) -> str:
     if events is None:
-        return "not_run"
+        # `crunch` now runs the cadence itself and stores the result per hit (backlog B7).
+        own = row.get("cadence")
+        return {"passed": "passed", "failed": "failed"}.get(str(own), "not_run")
     if events.empty:
         return "failed"
     near = events[(events["frequency_mhz"] - row["frequency_mhz"]).abs() < 50e-6]
@@ -78,7 +80,7 @@ def checklist(row: pd.Series, cadence: str, bands_flag: bool) -> list[dict]:
     return [
         {"check": "Drifts (non-zero Doppler drift, as an off-Earth source would)",
          "result": None if bool(row.get("drift_unresolved", False))
-         else not bool(row.get("zero_drift", 0))},
+         else not bool(row.get("stationary", row.get("zero_drift", 0)))},
         {"check": "Narrowband (<= 4 channels)", "result": bool(row.get("bandwidth_ch", 99) <= 4)},
         {"check": "Present in >= 75% of time samples",
          "result": bool(row.get("on_fraction", 0) >= 0.75)},

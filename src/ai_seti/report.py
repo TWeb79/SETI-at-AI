@@ -69,7 +69,9 @@ def write_outputs(results: list[dict], candidates: pd.DataFrame, outdir: Path, c
         snips = [np.asarray(s, dtype=np.float32) for s in candidates["_snippet"].head(200)]
         if snips:
             np.save(outdir / "snippets.npy", np.stack(snips))
-    spikes = [s for r in results for s in r.get("spikes", [])]
+    from .dsp.detectors import isolated_spikes
+    raw_spikes = [s for r in results for s in r.get("spikes", [])]
+    spikes = isolated_spikes(raw_spikes, candidates)
     pulses = [p for r in results for p in r.get("pulses", [])]
     pd.DataFrame(spikes).to_csv(outdir / "spikes.csv", index=False)
     pd.DataFrame(pulses).to_csv(outdir / "pulses.csv", index=False)
@@ -83,7 +85,9 @@ def write_outputs(results: list[dict], candidates: pd.DataFrame, outdir: Path, c
     stats = {
         "work_units": len(results), "errors": sum(1 for r in results if r.get("error")),
         "channels": channels, "hits": len(candidates), "spikes": len(spikes),
-        "pulses": len(pulses), "cpu_seconds": round(cpu, 2),
+        "spikes_on_tones": len(raw_spikes) - len(spikes), "pulses": len(pulses),
+        "pulses_undispersed": sum(1 for p in pulses if p.get("likely_rfi")),
+        "cpu_seconds": round(cpu, 2),
         "wall_seconds": round(wall_seconds, 2),
         "channels_per_second": round(channels / wall_seconds, 1) if wall_seconds else None,
         "stage_seconds": {k: round(v, 2) for k, v in stage.items()},
@@ -120,7 +124,7 @@ def write_outputs(results: list[dict], candidates: pd.DataFrame, outdir: Path, c
 
 def write_html(path: Path, candidates: pd.DataFrame, results: list[dict], meta: dict) -> None:
     keep = ["frequency_mhz", "drift_rate_hz_s", "snr", "interest", "ai_class", "anomaly",
-            "bandwidth_ch", "on_fraction", "zero_drift", "drift_unresolved", "known_rfi_band", "mirror_image",
+            "bandwidth_ch", "on_fraction", "zero_drift", "stationary", "drift_unresolved", "known_rfi_band", "mirror_image", "cadence",
             "multi_target", "unit_id",
             "p_technosignature_like", "_snippet"]
     top = candidates.head(REPORT_TOP)
@@ -288,7 +292,7 @@ function select(i){
   const c=D.candidates[i]; if(!c) return;
   document.querySelectorAll("#rows tr").forEach((tr,j)=>tr.setAttribute("aria-selected", j===i));
   $("headline").textContent = i===0 ? "Best signal of this run" : `Candidate ${i+1}`;
-  $("lede").textContent = `${D.target}${D.telescope? " ("+D.telescope+")":""} — a ${c.drift_unresolved? "narrowband tone (drift not measurable at this resolution)" : (c.zero_drift? "non-drifting narrowband tone":"drifting narrowband tone")}`;
+  $("lede").textContent = `${D.target}${D.telescope? " ("+D.telescope+")":""} — a ${c.drift_unresolved? "narrowband tone (drift not measurable at this resolution)" : ((c.stationary ?? c.zero_drift)? "non-drifting narrowband tone":"drifting narrowband tone")}`;
   $("score").innerHTML = `${fmt(c.interest,0)}<small>/ 100 interest</small>`;
   $("readout").innerHTML = [["Frequency",fmt(c.frequency_mhz,6)+" MHz"],["Drift rate",fmt(c.drift_rate_hz_s,3)+" Hz/s"],
     ["De-Doppler SNR",fmt(c.snr,1)],["AI says",(c.ai_class||"–").replaceAll("_"," ")],
@@ -296,11 +300,13 @@ function select(i){
     .map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
   const reasons=[];
   if(c.drift_unresolved) reasons.push("this data's channels are too wide to see any drift, so it cannot tell a moving source from one on Earth");
-  else if(!c.zero_drift) reasons.push("it drifts, as a transmitter on a rotating, orbiting planet would");
+  else if(!(c.stationary ?? c.zero_drift)) reasons.push("it drifts, as a transmitter on a rotating, orbiting planet would");
   else reasons.push("it does not drift, which usually means a transmitter on Earth (score reduced)");
   if(c.bandwidth_ch<=3) reasons.push("it is only "+fmt(c.bandwidth_ch,0)+(c.bandwidth_ch>=1.5?" channels":" channel")+" wide, and nature rarely makes tones this narrow");
   if(c.on_fraction>=.75) reasons.push("it is present in "+Math.round(c.on_fraction*100)+"% of time samples");
   if(c.known_rfi_band) reasons.push("but it sits in a band crowded with satellites (score halved)");
+  if(c.cadence==="failed") reasons.push("but it failed the ON/OFF test: it was there while pointing away, or missing in a pointing at the target (score cut to a fifth)");
+  if(c.cadence==="passed") reasons.push("and it passed the ON/OFF test: present in every pointing at the target, absent when pointing away");
   if(c.multi_target) reasons.push("but the same frequency turned up in a different target, so it cannot come from this one (score cut to a fifth)");
   if(c.mirror_image) reasons.push("but it is mirrored across the coarse-channel centre by a partner of equal or greater strength, an instrument artefact (score cut to a fifth)");
   $("why").textContent = "It scores "+fmt(c.interest,0)+" because "+reasons.join("; ")+".";
@@ -320,7 +326,7 @@ function drawBand(){
 }
 const s=D.stats;
 $("stats").innerHTML=[["work units",s.work_units],["channels",Number(s.channels).toLocaleString()],
- ["hits",s.hits],["CPU seconds",fmt(s.cpu_seconds,1)],["wall seconds",fmt(s.wall_seconds,1)],
+ ["hits",s.hits],["lone spikes",s.spikes??"–"],["pulses",s.pulses??"–"],["CPU seconds",fmt(s.cpu_seconds,1)],["wall seconds",fmt(s.wall_seconds,1)],
  ["channels / s",s.channels_per_second? Number(s.channels_per_second).toLocaleString():"–"]]
  .map(([k,v])=>`<div><b>${v}</b><span>${k}</span></div>`).join("");
 $("rows").innerHTML=D.candidates.map((c,i)=>`<tr tabindex="0"><td>${i+1}</td><td>${fmt(c.frequency_mhz,6)}</td><td>${fmt(c.drift_rate_hz_s,3)}</td>

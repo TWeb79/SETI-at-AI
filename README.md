@@ -90,11 +90,23 @@ per run; the next run continues at the next channel, and an observation only cou
 once every channel has been searched. Half of each run's `--limit` slots go to files not
 started yet, so new targets keep arriving while big files are worked through.
 
+What a file costs: a high-resolution `.0000` product is ~1 billion channels × 16 samples of
+float32, **64 GB** per scan. AI-SETI streams only the channels it searches, but the archive
+link measured ~7–8 MB/s, so a whole file takes **~2 hours**. One work unit (262,144 channels)
+is 16 MB. `--forever` therefore defaults to `--max-units 128` (~2 GB, ~4–5 min per visit);
+without `--forever` a file is searched whole unless you set `--max-units`. Analysis is ≤ 5% of
+the time; the rest is download, which is why the cadence check (6 scans) costs ~6×.
+
 `crunch` skips files it cannot usefully search, and records why in `data/state.json`:
 mid-resolution products (`.0002`), whose channels are too wide to measure drift (use the
 `.0000` file of the same scan, or `--include-unresolvable`), and high-time-resolution products
 (`.8.0001`), which are pulsar data and would need ~26 GB per work unit. `--retry-failed`
 forgets recorded failures after an update.
+
+Without a terminal (or with `--no-live`) `crunch` prints plain status lines instead of the
+live dashboard: `Pass 2 · file 3`, how many units and MB it is about to fetch, then per unit
+how long the download and the analysis took and the MB/s, the cadence scans it is
+searching, and at the end of each pass the files, MB and average speed.
 
 After each observation `crunch` prints, besides the top-candidates table, a plain summary:
 how far through the file this run got, how many signals rose above the noise, why each one was
@@ -143,9 +155,9 @@ impostor.
 | Property | Why it matters | How AI-SETI checks it | Impostor it rules out |
 |---|---|---|---|
 | **Narrowband** (one or a few channels, ~3 Hz each) | No known natural process makes Hz-wide tones; the narrowest natural lines (masers) are hundreds of Hz wide. | `bandwidth_ch`, wide hits (> 8 channels) lose 60% of their score | broadband interference, natural emission |
-| **Drifts** (non-zero `drift_rate_hz_s`) | A transmitter on another planet accelerates relative to us, and its frequency slides. A transmitter on Earth moves *with* the telescope and stays put. | Taylor-tree de-Doppler search over ±4 Hz/s; `zero_drift` costs 70% of the score and blocks sharing | ground transmitters, the receiver's own tones |
+| **Drifts** (non-zero `drift_rate_hz_s`) | A transmitter on another planet accelerates relative to us, and its frequency slides. A transmitter on Earth moves *with* the telescope and stays put. | Taylor-tree de-Doppler search over ±4 Hz/s; `stationary` (at most one channel of drift over the whole scan, which is within the noise) costs 70% of the score and blocks sharing | ground transmitters, the receiver's own tones |
 | **Steady** (present all through the scan) | A beacon should be there in every sample, not flicker. | `on_fraction`, `modulation`, `wobble_rms` | intermittent and frequency-hopping interference |
-| **Only at the target** | A signal from a star is only seen when the telescope points at that star. | Same frequency, or a busy band, already seen at *another* star → `multi_target`; the ON/OFF `cadence` filter | anything picked up through the side of the beam |
+| **Only at the target** | A signal from a star is only seen when the telescope points at that star. | Same frequency, or a busy band, already seen at *another* star → `multi_target`; the ON/OFF cadence (`cadence = failed` cuts the score to a fifth) | anything picked up through the side of the beam |
 | **Not an instrument artefact** | GBT coarse channels make mirror copies of strong tones around each channel centre. | `mirror_pair`, `mirror_image` (score cut to a fifth) | the receiver's own spectral images |
 | **Outside known interference bands** | GPS, Galileo, Iridium, Inmarsat and others own fixed bands. | `known_rfi_band` (score halved) | satellites |
 | **Plausible strength** | The AI was trained on SNRs up to ~40. Far stronger tones are almost always nearby transmitters. | `out_of_distribution`: score cut by 70% and capped at 50 | strong terrestrial carriers |
@@ -202,8 +214,10 @@ re-observation.
    bandpass ripple is divided out, and every block of channels is scaled to unit noise.
 3. **Search.** A Taylor-tree de-Doppler search adds up power along every straight line in the
    waterfall, from zero drift to the limit, both directions. Lines that rise above **SNR 10**
-   become hits. A one-sample spike search and a dispersed-pulse search also run; they only
-   write `spikes.csv` and `pulses.csv` (backlog B37).
+   become hits. A one-sample spike search and a dispersed-pulse search (the SETI@home and
+   Astropulse ideas) also run. Spikes that are just samples of a tone already found are
+   dropped; the rest, and any pulses, are counted in the summary and listed in `spikes.csv`
+   and `pulses.csv`. A pulse without dispersion is marked as terrestrial.
 4. **Describe.** Each hit gets physical features (width, steadiness, wobble, side-lobes, …)
    and a small de-drifted image of itself.
 5. **Judge.** The AI classifies each hit (see [the AI part](#the-ai-part-and-how-it-works-with-the-search)),
@@ -213,10 +227,12 @@ re-observation.
 
 The technical one-screen version is [How a work unit is processed](#how-a-work-unit-is-processed).
 
-**What a high score is not.** Interest is a ranking, not a probability of ET. The strongest
-remaining test, pointing away and back (the ON/OFF cadence), still has to be run by hand with
-`ai-seti cadence` on archive data (backlog B7), and the classifier has only seen slower drifts
-than the search covers (backlog B3).
+**What a high score is not.** Interest is a ranking, not a probability of ET. `crunch`
+runs the strongest test, pointing away and back (the ON/OFF cadence), automatically when it
+processes the *target* scan of an archive cadence. It searches the same channels in the other
+five scans, and each hit's `cadence` column says `passed`, `failed`, `untestable` (an OFF
+pointing, or too few scans) or `not_run`. A pass still needs a re-observation, and the
+classifier has only seen slower drifts than the search covers (backlog B3).
 
 ## Where unusual signals end up, and how to report them
 
@@ -226,10 +242,10 @@ Every observation gets its own folder under `reports/` (`reports/crunch/<file>` 
 | File | What is in it | Use it to |
 |---|---|---|
 | `report.html` | The top candidates, with a plain-language "why it scores this" for each and a 3D view of the best one | look first |
-| `candidates.csv` | **Every** hit, one row each: `frequency_mhz`, `drift_rate_hz_s`, `snr`, `interest`, `ai_class` and `p_*` probabilities, `anomaly`, and the flags `zero_drift`, `drift_unresolved`, `known_rfi_band`, `mirror_pair`, `mirror_image`, `multi_target` | sort, filter, check |
+| `candidates.csv` | **Every** hit, one row each: `frequency_mhz`, `drift_rate_hz_s`, `snr`, `interest`, `ai_class` and `p_*` probabilities, `anomaly`, and the flags `stationary`, `drift_unresolved`, `known_rfi_band`, `mirror_pair`, `mirror_image`, `multi_target` | sort, filter, check |
 | `metadata.json` | Config, software versions, file header, the drift range actually searched, timings, AI warnings | reproduce the run |
 | `band_overview.png` | The whole searched band at a glance | spot crowded regions |
-| `spikes.csv`, `pulses.csv` | By-products of the secondary detectors (see B37) | rarely needed |
+| `spikes.csv`, `pulses.csv` | Lone single-sample spikes (not part of any tone) and broadband pulses, with `likely_rfi` for undispersed ones | check a short burst |
 
 An **unusual signal** is a row with `ai_class = technosignature_like`, a high `interest`, and
 none of the flags set. The terminal verdict counts exactly these ("N signal(s) passed every

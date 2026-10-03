@@ -5,7 +5,7 @@ Author: Inventions4All — github:TWeb79
 Applies to: **v0.3.0**. Opened at the end of the 0.3.0 hardening pass
 (see [implementationplan.md](implementationplan.md)).
 
-Fixed items are removed from this file once done (last cleanup 2026-10-03: B29, B19, B28, B10, B31, B33, B34, B35, B32, B30, B21, B27, B15, B1, B2, B22, B23, B24, B25, B26, B16, B14, B17, B12, B4, B5, B6, B8,
+Fixed items are removed from this file once done (last cleanup 2026-10-03: B39, B44, B43, B42, B40, B38, B7, B37, B36, B29, B19, B28, B10, B31, B33, B34, B35, B32, B30, B21, B27, B15, B1, B2, B22, B23, B24, B25, B26, B16, B14, B17, B12, B4, B5, B6, B8,
 B9, B11, B13, B18, B20, B7(b) and B19's labelling). Their write-ups, the two real-data runs of
 2026-10-03 and the regression tests that pin them are in git history.
 
@@ -19,44 +19,18 @@ a plausible configuration · **low** = quality, debt or hygiene.
 
 | ID | Severity | Summary | Area |
 |---|---|---|---|
-| B7 | high | Archive cadences are never grouped, so the ON/OFF filter never runs automatically | `cli.py`, `sources.py` |
+| B41 | low | An OFF scan crunched on its own re-downloads ranges its cadence already searched (cadence-to-cadence reuse is done) | `cli.py`, `state.py` |
 | B3 | high | The classifier never sees the drift regime it must score in production | `ai/model.py` |
-| B36 | med | A stationary tone is reported as drifting 6% of the time and escapes the Earth-source penalty | `ai/features.py`, `pipeline.py`, `share.py` |
-| B37 | low | Spikes and pulses are computed and saved, but never scored, summarised or shared, and spikes repeat de-Doppler hits | `dsp/detectors.py`, `report.py` |
 
-**Suggested order.** B36 (a stationary tone can pass as drifting), then B37 (use or drop the
-spike and pulse by-products), then B3 (retrain). B7 needs a design for inferring cadences from
-the archive's metadata before any code.
+**Suggested order.** The performance findings of 2026-10-03 (B38–B44): B38 first (a one-line
+change, the biggest gain in `--forever` mode), then B39 (status), B42 (process pool),
+B41 (cadence cost), B43, B44. Then B3 (retrain).
 
 ---
 
 # Bugs
 
 ## High
-
-### B7 — archive cadences are never grouped, so the ON/OFF filter never runs automatically
-
-Part (b) of this item is done: `rfi.flag_multi_target` flags a frequency already seen in a
-different target. What remains is (a). The HIP2579, HIP2586 and HIP3249 files under
-`LHS1140/C/` were recorded on the same day (MJD 57774) in consecutive scans: very likely the
-OFF pointings of one LHS 1140 cadence. `BreakthroughListenSource` already reads `cadence_url`
-(`src/ai_seti/sources.py`), but `crunch` never uses it, and `ai-seti cadence` only accepts
-local files. The cadence filter, the strongest RFI test there is, therefore never runs on
-archive data.
-
-**Blocked on design (checked live 2026-10-03).** The archive's `query-files` rows carry **no
-`cadence_url` field**. Each row has only `target`, `ra`, `decl`, `mjd`, `center_freq`, `size`,
-`md5sum`, `utc` and `url`, so the plan below cannot work as written. A cadence has to be
-inferred instead: same day (`mjd`), same receiver (`center_freq` band), scans a few minutes
-apart. ON vs OFF also can't be read from file names here: the LHS 1140 files are each named after
-their own HIP star. One option is to treat the target the user asked for as ON and the
-neighbouring scans as OFF.
-
-**Fix (original plan).** Group archive files by `cadence_url`; when a group is complete (≥ 2 ON,
-≥ 1 OFF), run `cadence_filter` and feed its `events.csv` into scoring and sharing.
-
-**Test.** A fake source yielding one ON/OFF/ON/OFF group with a tone only in the ONs: `crunch`
-writes an event that passes; the same tone in an OFF fails it.
 
 ### B3 — the classifier never sees the drift regime it has to score in production
 
@@ -85,40 +59,44 @@ drift), the open part of the former B8. Strong, slowly drifting carriers are amo
 common terrestrial RFI, and the classifier has never seen one. Until then the SNR guard in
 `ai.model.ood_snr_limit` labels such hits `out_of_distribution`.
 
+## Performance of `crunch --forever` (analysed 2026-10-03)
+
+Measured on this machine (10 cores) against the Breakthrough Listen archive, with the
+per-stage timings every run stores in `metadata.json` (25 real runs) plus targeted probes.
+
+| What | Measured |
+|---|---|
+| Share of run time spent **loading data** | **92–99%** (high-res 92–97%, mid-res 96–99%); preprocessing 0–1%, de-Doppler 2–5%, AI 0–4% |
+| High-res throughput (`.0000`, 16 samples) | 117–138 k channels/s ≈ **7–8 MB/s**; 8 units of 262,144 channels in 15–18 s |
+| One HTTP Range request | ~400 ms to the first byte; 1 MB at **0.2 MB/s**, 4 MB at 0.5 MB/s, 16 MB at 1.9 MB/s |
+| Parallel 1 MB requests | 1: 0.5 MB/s · 4: 2.0 · 8: 4.3 · 16: 6.6 · 32: **7.2 MB/s** (levels off: a link or server ceiling) |
+| Requests in flight today | 8 worker processes × 8 threads = **64**, each a new connection |
+| Process pool + model load per observation | **~2 s** (8 workers, 1.6–1.7 s each) |
+| File sizes (HIP2579, one scan) | `.0000` **64 GB** (1,073,741,824 ch × 16 samples × float32) · `.0002` 1.06 GB · `.8.0001` 6.4 GB. No HDF5 version is offered for these scans. |
+| Time to stream one whole `.0000` file at ~8 MB/s | **~2.2 h**; `--max-units 8` reads 128 MB (0.2%) per visit, ~512 visits per file |
+
+The search itself is not the bottleneck: the CPU workers wait on the network ~95% of the
+time. The levers are, in order: don't sleep while work is waiting (B38), make each byte cheaper
+to fetch (B40), don't fetch the same bytes twice (B41), and stop paying fixed costs per
+observation (B42, B43).
+
+### B41 — an OFF scan crunched on its own re-downloads ranges its cadence already searched
+
+Half done. Every searched (scan, channel range) now caches its hits under `data/cache/hits/`
+(keyed by URL, range, search settings and scoring version), and the cadence step reads the
+cache before downloading. So the 2nd and 3rd target scans of a cadence download only
+themselves (test: `test_cadence_reuses_scans_already_searched`, 4 → 1 searches). What remains:
+when the archive later returns an OFF scan (e.g. HIP2579) as an observation of its own, `crunch`
+downloads ranges the cadence step already searched, because its report needs full per-unit
+results (spikes, thumbnails, timings), not just hits.
+
+**Fix.** Either cache full unit results (bigger, but complete), or let `crunch` build the
+report for such a range from the cached hits and skip the download, marking the report "from
+cadence search".
+
 ## Medium
 
-### B36 — a stationary tone is reported as drifting 6% of the time and escapes the Earth-source penalty
-
-Found in the B30 review. `zero_drift` is `|drift| < 0.02` channels/step (`ai/features.py`), but
-the Taylor tree's smallest non-zero step with 16 samples is 1/15 ≈ 0.067 channels/step,
-±0.010 Hz/s on high-res BL data. That is one channel over the whole observation, within the
-measurement noise of "not drifting". Measured: 200 perfectly stationary tones split across two
-channels at random sub-channel positions (SNR ~16) were detected 194 times; **12 (6%) came back
-with a one-step drift and were labelled drifting**. They then escape the ×0.3 zero-drift penalty,
-pass the share gate's "Drifts" check, and count as "drifting, as a transmitter on a rotating
-planet would" in the report. Real data is full of ±0.010 Hz/s hits.
-
-**Fix.** Treat `|drift| ≤ 1 tree step` (≤ 1 channel over the observation) as stationary for
-scoring, the gate and the wording. Keep the model feature `zero_drift` as it is, because the
-bundled classifier was trained on it, or change both together at the B3 retrain.
-
-**Test.** The 200-tone experiment above: no stationary tone is scored or gated as drifting.
-
 ## Low
-
-### B37 — spikes and pulses are computed and saved, but never used
-
-Found in the B30 review. Every work unit also runs the SETI@home-style spike detector and the
-Astropulse-style dispersed-pulse search (`dsp/detectors.py`). The results go only to
-`spikes.csv` and `pulses.csv`, and their counts into `metadata.json`. Nothing scores them,
-flags them, puts them in the HTML report, the terminal summary or the share gate. On high-res
-files 100% of spikes sit within 1 kHz of a de-Doppler hit: strong carriers re-reported sample
-by sample, ~140–220 rows per file with 19–68 distinct channels. On mid-res files every pulse
-found had DM < 1 (`likely_rfi`).
-
-**Fix.** Either drop spikes that coincide with a de-Doppler hit and show the rest in the
-summary and report, or say plainly in the README that they are raw by-products. The
-documentation pass (B31) does the latter for now.
 
 ## Test debt
 
@@ -163,6 +141,15 @@ These are documented honestly in the README but have no plan attached:
 
 ## Verified — *not* bugs
 
+
+**"Keep-alive connections, fewer threads or prefetching will speed up `crunch`."** Tried and
+measured 2026-10-03 (B40), then reverted. A kept-alive connection carries about twice the data
+of a fresh one (0.22 vs 0.125 MB/s), but the total levels off at the same **~7–8 MB/s** link or
+server ceiling, which today's 8 workers × 8 fresh connections already reach. Four units in a
+row in one worker: 62 s old vs 74 s with 4 kept-alive threads. Two full 8-unit runs with 8
+kept-alive threads: 20.4 s and 23.8 s, against 15–18 s before. Analysis is ≤ 5% of run time,
+so prefetching can't win more than that. Gains have to come from not idling (B38, done), not
+downloading twice (B41) and fixed costs (B42, B43).
 Recorded so they are not re-investigated.
 
 **"RA / Dec 8.20833 / −13.2575 in the dashboard is wrong."** False. The archive reports RA in

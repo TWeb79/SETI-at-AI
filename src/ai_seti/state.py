@@ -4,6 +4,7 @@ Lets `ai-seti crunch` resume after a restart and never re-process an observation
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ class Ledger:
     progress: dict = field(default_factory=dict)    # observation -> next unsearched channel
     failed: dict = field(default_factory=dict)      # observation -> {"attempts", "reason"}
     signals: list = field(default_factory=list)     # [frequency_mhz, target] seen so far
+    sah_status: dict = field(default_factory=dict)  # last SETI@home probe {"at", "result"}
     started_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @classmethod
@@ -72,6 +74,54 @@ class Ledger:
     def done(self, obs: str) -> None:
         if obs not in self.observations_done:
             self.observations_done.append(obs)
+
+    def seti_at_home_status(self, probe, max_age_h: float = 24.0) -> dict:
+        """The SETI@home probe result, reusing one up to `max_age_h` old (backlog B43).
+
+        The probe only feeds a status line, but an unreachable server cost every `crunch` start
+        its full timeout. `probe` is called only when the cached answer is missing or stale.
+        """
+        at = self.sah_status.get("at")
+        if at and (datetime.now(UTC) - datetime.fromisoformat(at)).total_seconds() < max_age_h * 3600:
+            return self.sah_status["result"]
+        result = probe()
+        self.sah_status = {"at": datetime.now(UTC).isoformat(), "result": result}
+        return result
+
+    # --- unit results per (scan, channel range), so no range is downloaded twice (B41) ---
+    CACHE_KEYS = ("snr_threshold", "max_drift_rate_hz_s", "max_drift_ch_per_step",
+                  "channels_per_unit", "bandpass_block", "remove_dc_spike",
+                  "fine_channels_per_coarse", "use_ai", "model_path", "spike_threshold",
+                  "pulse_threshold", "max_dm", "n_dm_trials", "max_hits_per_unit")
+
+    def _results_file(self, url: str, rng, cfg, version: str) -> Path:
+        key = json.dumps([url, list(rng or ()), version,
+                          {k: getattr(cfg, k) for k in self.CACHE_KEYS}], default=str)
+        name = hashlib.sha1(key.encode()).hexdigest()[:20] + ".pkl"
+        return self.path.parent / "cache" / "units" / name
+
+    def cached_results(self, url: str, rng, cfg, version: str) -> list | None:
+        """Work-unit results of this scan's channel range from an earlier search, or None.
+
+        `version` must change whenever the results would (code or model), see
+        `pipeline.results_version`. The cache is a local file this program wrote itself.
+        """
+        import pickle
+        f = self._results_file(url, rng, cfg, version)
+        if not f.exists():
+            return None
+        try:
+            return pickle.loads(f.read_bytes())
+        except Exception:   # truncated or from another version: search again
+            return None
+
+    def store_results(self, url: str, rng, cfg, version: str, results: list) -> None:
+        import pickle
+        f = self._results_file(url, rng, cfg, version)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_bytes(pickle.dumps(results))
+        os.replace(tmp, f)
 
     def remember_signals(self, freqs_mhz, target: str) -> None:
         """Keep the run's strongest frequencies so a later target can recognise them."""

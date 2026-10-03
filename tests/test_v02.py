@@ -231,3 +231,49 @@ def test_sigproc_header_with_empty_string_value_parses(tmp_path):
         fch1=1420.0, foff=-1e-3, nchans=64, tsamp=1.0, nsamples=4, source_name=""))
     hdr = read_header(p)
     assert hdr.source_name == "" and hdr.nchans == 64 and hdr.nsamples == 4
+
+
+def test_stationary_tones_are_never_scored_as_drifting(tmp_path):
+    """B36: a one-step drift (one channel over the scan) used to escape the Earth penalty."""
+    rng = np.random.default_rng(11)
+    n_chan, tones = 65536, np.arange(1000, 64600, 400)
+    d = noise_waterfall(16, n_chan, rng)
+    sigma = d.std(axis=0)
+    for c0 in tones:                              # stationary, split across two channels
+        w = rng.uniform(0, 1)
+        d[:, c0] += 4 * (1 - w) * sigma[c0]
+        d[:, c0 + 1] += 4 * w * sigma[c0 + 1]
+    hdr = FilterbankHeader(fch1=1420.0, foff=-2.7939677238464355e-06, nchans=n_chan,
+                           tsamp=18.253611008, nsamples=16, source_name="T")
+    p = tmp_path / "s.fil"
+    write_sigproc(p, d, hdr)
+    hdr = read_header(p)
+    cfg = SearchConfig(channels_per_unit=16384, workers=1, use_ai=False)
+    cands = score_candidates(list(run_units(split(str(p), hdr, cfg), cfg, workers=1)), cfg)
+    on_tone = cands[np.isin(cands["channel"], np.concatenate([tones, tones + 1]))]
+    assert len(on_tone) >= 40
+    assert (on_tone["zero_drift"] == 0).any(), "the one-step case must occur, or this proves nothing"
+    assert on_tone["stationary"].all(), "every stationary tone is treated as stationary"
+
+
+def test_spikes_on_a_known_tone_are_dropped_lone_ones_kept():
+    """B37: on real data nearly every spike was a sample of a carrier already found."""
+    from ai_seti.dsp.detectors import isolated_spikes
+
+    hits = pd.DataFrame({"channel": [1000], "drift_ch_per_step": [2.0], "bandwidth_ch": [10.0]})
+    on_track = [{"time_index": t, "channel": 1000 + 2 * t} for t in range(16)]
+    on_wing = {"time_index": 3, "channel": 1006 + 12}            # within the tone's 10-ch width
+    lone = {"time_index": 5, "channel": 5000}
+    assert isolated_spikes([*on_track, on_wing, lone], hits) == [lone]
+    assert isolated_spikes([lone], hits.iloc[0:0]) == [lone]
+
+
+def test_worker_pool_is_reused_across_observations(tmp_path):
+    """B42: a new pool (and 8 model loads) per observation cost ~2 s each time."""
+    p = tmp_path / "t.fil"
+    _write_fil(p)
+    hdr = read_header(p)
+    cfg = SearchConfig(channels_per_unit=16384, workers=2, use_ai=False)
+    first = {r["pid"] for r in run_units(split(str(p), hdr, cfg), cfg)}
+    second = {r["pid"] for r in run_units(split(str(p), hdr, cfg, chan_range=(0, 32768)), cfg)}
+    assert second <= first, "the second call ran in the same worker processes"

@@ -8,9 +8,11 @@ Across the run (main process):
 """
 from __future__ import annotations
 
+import atexit
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -90,6 +92,9 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
         dc = (abs_start // nfine) * nfine + nfine // 2 if nfine else None
         row["mirror_channel"] = 2 * dc - abs_start if dc is not None else -1
         row["drift_unresolved"] = unresolved
+        # One search step (one channel over the whole scan) is within the noise of "not
+        # drifting": 6% of perfectly stationary tones come back with exactly that (B36).
+        row["stationary"] = bool(abs(h.drift_ch_per_step) * max(z.shape[0] - 1, 1) <= 1 + 1e-6)
         rows.append(row)
         vectors.append(feature_vector(feats, img))
         row["_snippet"] = img.round(3).tolist()
@@ -126,12 +131,33 @@ def _worker_init():
     _limit_threads()
 
 
+_POOLS: dict[int, ProcessPoolExecutor] = {}
+
+
+def _pool(n: int) -> ProcessPoolExecutor:
+    """One worker pool per size for the whole process (backlog B42).
+
+    Starting 8 workers and loading the classifier in each costs ~2 s; a `crunch` session used
+    to pay that for every observation, and the cadence check six times per target scan. A pool
+    broken by a crashed worker is replaced on the next call.
+    """
+    pool = _POOLS.get(n)
+    if pool is None or getattr(pool, "_broken", False):
+        pool = _POOLS[n] = ProcessPoolExecutor(max_workers=n, initializer=_worker_init)
+    return pool
+
+
+@atexit.register
+def _close_pools() -> None:
+    for pool in _POOLS.values():
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
 def run_units(units: list[WorkUnit], cfg: SearchConfig, on_result=None,
               workers: int | None = None):
     """Process units in parallel; yields results as they complete (for live UIs)."""
-    n = workers or cfg.workers or os.cpu_count() or 1
-    n = max(1, min(n, len(units)))
-    if n == 1:
+    size = max(1, workers or cfg.workers or os.cpu_count() or 1)
+    if min(size, len(units)) <= 1:
         _limit_threads()
         for wu in units:
             try:
@@ -142,21 +168,30 @@ def run_units(units: list[WorkUnit], cfg: SearchConfig, on_result=None,
                 on_result(res)
             yield res
         return
-    with ProcessPoolExecutor(max_workers=n, initializer=_worker_init) as pool:
-        futures = {pool.submit(process_work_unit, wu, cfg): wu for wu in units}
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-            except Exception as exc:
-                res = _failed_result(futures[fut], exc)
-            if on_result:
-                on_result(res)
-            yield res
+    pool = _pool(size)   # keyed by requested size, so every call reuses the same pool
+    futures = {pool.submit(process_work_unit, wu, cfg): wu for wu in units}
+    for fut in as_completed(futures):
+        try:
+            res = fut.result()
+        except Exception as exc:
+            res = _failed_result(futures[fut], exc)
+        if on_result:
+            on_result(res)
+        yield res
 
 
 # Bump when the interest score changes meaning (new flags, penalties, caps), so a lifetime
 # best recorded under older rules is not shown as if it were comparable (backlog B27).
 SCORING_VERSION = 2
+
+
+def results_version(cfg: SearchConfig) -> str:
+    """Identifies what unit results depend on beyond the config: the code and the model file."""
+    from . import __version__
+    from .ai.model import DEFAULT_MODEL
+    model = Path(cfg.model_path) if cfg.model_path else DEFAULT_MODEL
+    st = model.stat() if cfg.use_ai and model.exists() else None
+    return f"{__version__}:{SCORING_VERSION}:{st.st_size if st else 0}:{st.st_mtime_ns if st else 0}"
 
 
 def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
@@ -175,7 +210,9 @@ def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
 
     thr = cfg.snr_threshold
     s_snr = np.clip(1 - np.exp(-(df["snr"] - thr) / thr), 0, 1)
-    heuristic = ((df["zero_drift"] == 0) & (df["bandwidth_ch"] <= 4)
+    stationary = (df["stationary"].fillna(False).astype(bool) if "stationary" in df
+                  else df["zero_drift"] > 0)
+    heuristic = (~stationary & (df["bandwidth_ch"] <= 4)
                  & (df["on_fraction"] >= 0.5)).astype(float) * 0.7
     from .ai.model import HitScorer, ood_snr_limit
     # Far above the training SNRs the classifier saturates (B8): don't trust p there. The
@@ -189,7 +226,7 @@ def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
     score = 0.55 * p_et + 0.20 * s_snr + 0.25 * anomaly
     # "Doesn't drift" is evidence of an Earth source only where drift could have been seen (B19).
     unresolved = df.get("drift_unresolved", pd.Series(False, index=df.index)).fillna(False)
-    score *= np.where((df["zero_drift"] > 0) & ~unresolved.astype(bool), 0.3, 1.0)
+    score *= np.where(stationary & ~unresolved.astype(bool), 0.3, 1.0)
     score *= np.where(df["known_rfi_band"], 0.5, 1.0)
     score *= np.where(df["bandwidth_ch"] > 8, 0.4, 1.0)
     score *= np.where(df["mirror_image"], 0.2, 1.0)

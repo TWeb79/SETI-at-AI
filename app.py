@@ -130,10 +130,10 @@ if st.sidebar.button("Start crunching", type="primary"):
         bar.progress(i / len(units), text=f"{i}/{len(units)} work units")
     cands = score_candidates(results, cfg)
     out = Path(tempfile.mkdtemp(prefix="ai_seti_"))
-    write_outputs(results, cands, out, cfg, f"AI-SETI search of {meta['target']}",
+    stats = write_outputs(results, cands, out, cfg, f"AI-SETI search of {meta['target']}",
                   {"location": str(location), "observation": meta, "header": header.to_dict(),
                    "drift_resolvable": drift_resolvable(header, cfg)}, time.time() - t0)
-    st.text("\n".join(explain_run(cands, cfg.snr_threshold, chan_range, header.nchans)))
+    st.text("\n".join(explain_run(cands, cfg.snr_threshold, chan_range, header.nchans, stats)))
     components.html((out / "report.html").read_text(), height=1500, scrolling=True)
     st.download_button("Download candidates CSV", (out / "candidates.csv").read_bytes(),
                        file_name="candidates.csv", mime="text/csv")

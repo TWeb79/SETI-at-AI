@@ -29,11 +29,74 @@ def _cfg(config: Path, workers: int | None = None, snr: float | None = None) -> 
     return cfg
 
 
+def _run_cadence(cands, cadence: list[dict], location, header, cfg: SearchConfig,
+                 chan_range, ledger=None) -> tuple:
+    """Search the same channels in the other scans of this cadence and test each hit (B7)."""
+    import pandas as pd
+
+    from .io.filterbank import read_header
+    from .io.remote import remote_header
+    from .pipeline import results_version, run_units, score_candidates
+    from .rfi import apply_cadence, cadence_filter, cadence_is_testable
+    from .sources import split
+
+    version = results_version(cfg)
+
+    me = next((s for s in cadence if s["url"] == str(location)), None)
+    on_target = next((s["target"] for s in cadence if s["is_on"]), "?")
+    if me is None or not me["is_on"]:
+        print(f"[dim]Cadence: this scan is an OFF pointing of the {on_target} cadence, so its "
+              "hits can't be cadence-tested.[/dim]")
+        return apply_cadence(cands, "untestable"), {"status": "untestable", "on_target": on_target}
+    empty = pd.DataFrame(columns=["frequency_mhz", "drift_rate_hz_s", "snr"])
+    scans, fetched = [], 0
+    for s in cadence:
+        name = s["url"].rsplit("/", 1)[-1]
+        cached = (ledger.cached_results(s["url"], chan_range, cfg, version)
+                  if ledger is not None and s is not me else None)
+        if s is me:
+            hits = cands
+        elif cached is not None:
+            hits = score_candidates(cached, cfg)
+        else:
+            fetched += 1
+            print(f"[dim]Cadence: searching {s['target']} ({'ON' if s['is_on'] else 'OFF'} "
+                  f"scan, {fetched} of up to {len(cadence) - 1} others)…[/dim]")
+            try:
+                hdr = remote_header(s["url"]) if s["kind"] == "remote" else read_header(Path(s["url"]))
+                if hdr.nchans != header.nchans:
+                    raise ValueError("different channelisation")
+                units = split(s["url"], hdr, cfg, s["kind"], chan_range=chan_range, meta={})
+                unit_results = list(run_units(units, cfg))
+                hits = score_candidates(unit_results, cfg)
+                if ledger is not None:
+                    ledger.store_results(s["url"], chan_range, cfg, version, unit_results)
+            except Exception as exc:   # one unreadable scan makes the test incomplete, not a crash
+                print(f"[yellow]Cadence: could not search {name}: {exc}[/yellow]")
+                continue
+        scans.append({"name": name, "mjd": s["mjd"], "is_on": s["is_on"],
+                      "hits": hits if not hits.empty else empty})
+        print(f"[dim]Cadence: {s['target']} ({'ON ' if s['is_on'] else 'OFF'}) "
+              f"{len(hits):,} signal(s){' (cached)' if cached is not None else ''}[/dim]")
+    testable, reason = cadence_is_testable(scans)
+    if not testable:
+        print(f"[yellow]Cadence not testable: {reason}[/yellow]")
+        return apply_cadence(cands, "untestable"), {"status": "untestable", "reason": reason}
+    events = cadence_filter(scans, reference=me["url"].rsplit("/", 1)[-1])
+    cands = apply_cadence(cands, "tested", events)
+    n_pass = int((cands["cadence"] == "passed").sum()) if "cadence" in cands else 0
+    print(f"Cadence ({on_target}, {sum(s['is_on'] for s in scans)} ON / "
+          f"{sum(not s['is_on'] for s in scans)} OFF): {n_pass:,} of {len(cands):,} signal(s) "
+          "passed.")
+    return cands, {"status": "tested", "on_target": on_target, "passed": n_pass,
+                   "scans": [s["name"] for s in scans]}
+
+
 def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: Path,
-                       live: bool = True, ledger=None, chan_range=None):
+                       live: bool = True, ledger=None, chan_range=None, cadence=None):
     """Split -> parallel process (with live dashboard) -> score -> write outputs."""
     from .dashboard import CrunchDashboard
-    from .pipeline import SCORING_VERSION, run_units, score_candidates
+    from .pipeline import SCORING_VERSION, results_version, run_units, score_candidates
     from .report import write_outputs
     from .sources import drift_resolvable, split
 
@@ -48,7 +111,17 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
     dash.meta = meta
     results = []
     t0 = time.time()
-    if live and console.is_terminal:
+    version = results_version(cfg)
+    cached = (ledger.cached_results(str(location), chan_range, cfg, version)
+              if ledger is not None else None)
+    if cached is not None:
+        # Searched already, as part of a cadence: reuse it instead of downloading again (B41).
+        print(f"[dim]Reusing {len(cached)} work unit(s) already searched for a cadence; "
+              "nothing to download.[/dim]")
+        results = cached
+        for res in results:
+            dash.update(res)
+    elif live and console.is_terminal:
         from rich.live import Live
         with Live(dash.render(), console=console, refresh_per_second=4) as lv:
             for res in run_units(units, cfg):
@@ -56,10 +129,23 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
                 dash.update(res)
                 lv.update(dash.render())
     else:
+        # Plain status (B39): what is about to happen, then download and analysis per unit.
+        bytes_per_ch = header.nsamples * header.nifs * header.bytes_per_value
+        total_mb = sum(u.chan_stop - u.chan_start for u in units) * bytes_per_ch / 2**20
+        print(f"[dim]{'downloading' if kind == 'remote' else 'reading'} and analysing "
+              f"{len(units)} work unit(s), ~{total_mb:,.0f} MB, "
+              f"{min(cfg.workers or os.cpu_count() or 1, len(units))} at a time…[/dim]")
         for res in run_units(units, cfg):
             results.append(res)
             dash.update(res)
             best = max((h["snr"] for h in res.get("hits", [])), default=0)
+            tm = res.get("timings", {})
+            unit_mb = res.get("n_channels", 0) * bytes_per_ch / 2**20
+            load_s = tm.get("load", 0.0)
+            phases = (f"  {'downloaded' if kind == 'remote' else 'read'} {unit_mb:,.0f} MB in "
+                      f"{load_s:.1f} s "
+                      f"({unit_mb / load_s:.1f} MB/s), analysed in "
+                      f"{sum(v for k, v in tm.items() if k != 'load'):.1f} s" if load_s else "")
             # Units run `n` at a time, so time left goes by batches, not by single units.
             n = min(cfg.workers or os.cpu_count() or 1, len(units))
             per_batch = (time.time() - t0) / -(-dash.done // n)
@@ -68,19 +154,27 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
             chans = f"{a:,}–{b:,}"
             print(f"[dim]{dash.done}/{len(units)} ({100 * dash.done // len(units)}%, "
                   f"~{left:.0f} s left)[/dim]  channels {chans}  "
-                  f"signals={len(res.get('hits', []))}  strongest SNR={best:,.1f}"
+                  f"signals={len(res.get('hits', []))}  strongest SNR={best:,.1f}{phases}"
                   + (f"  [red]{res['error']}[/red]" if res.get("error") else ""))
     wall = time.time() - t0
     cands = score_candidates(results, cfg)
+    if ledger is not None and cadence and cached is None:
+        # A sibling's cadence step, or this scan's own later crunch, can reuse these (B41).
+        ledger.store_results(str(location), chan_range, cfg, version, results)
     target = str(meta.get("target") or header.source_name)
     if ledger is not None and not cands.empty:
         from .rfi import flag_multi_target
         cands = flag_multi_target(cands, ledger.signals, target, cfg.multi_target_tol_khz,
                                   cfg.multi_target_band_khz, cfg.multi_target_band_hits)
+    cadence_meta = None
+    if cadence and not cands.empty:
+        cands, cadence_meta = _run_cadence(cands, cadence, location, header, cfg, chan_range,
+                                           ledger)
     title = f"AI-SETI search of {meta.get('target') or Path(str(location)).name}"
     stats = write_outputs(results, cands, outdir, cfg, title,
                           {"location": str(location), "observation": meta,
-                           "header": header.to_dict(), "drift_resolvable": resolvable}, wall)
+                           "header": header.to_dict(), "drift_resolvable": resolvable,
+                           "cadence": cadence_meta}, wall)
     if ledger is not None:
         for r in results:
             ledger.record_unit(r)
@@ -107,10 +201,13 @@ def _summary(cands, stats, outdir: Path, n: int = 8):
     print(f"Report: {outdir / 'report.html'}")
 
 
+FOREVER_MAX_UNITS = 128
+
 # Why a signal is set aside, strongest evidence first; each signal is counted once, under the
 # first reason that applies. The wording is for people who don't read SNR tables.
 SET_ASIDE = [
     ("mirror_image", "receiver artefacts: mirror pairs around a channel centre"),
+    ("cadence_failed", "failed the ON/OFF test: seen while pointing away, or not every time"),
     ("multi_target", "seen (or in a band busy with signals) at another star, so not from this one"),
     ("known_rfi_band", "inside a band used by satellites or radio services"),
     ("stationary", "do not drift, so almost certainly transmitted from Earth"),
@@ -130,10 +227,13 @@ def _set_aside_masks(cands) -> dict:
 
     cls = cands["ai_class"].astype(str) if "ai_class" in cands else pd.Series("", cands.index)
     unresolved = flag("drift_unresolved")
+    stationary = (flag("stationary") if "stationary" in cands
+                  else cands["zero_drift"] > 0 if "zero_drift" in cands else none)
     return {
         "mirror_image": flag("mirror_image"), "multi_target": flag("multi_target"),
+        "cadence_failed": (cands["cadence"] == "failed") if "cadence" in cands else none,
         "known_rfi_band": flag("known_rfi_band"),
-        "stationary": (cands["zero_drift"] > 0) & ~unresolved if "zero_drift" in cands else none,
+        "stationary": stationary & ~unresolved,
         "out_of_distribution": cls == "out_of_distribution",
         "drift_unresolved": unresolved,
         "ai_rfi": cls.str.startswith("rfi_"),
@@ -142,7 +242,7 @@ def _set_aside_masks(cands) -> dict:
 
 
 def explain_run(cands, snr_threshold: float, rng: tuple[int, int] | None = None,
-                nchans: int | None = None) -> list[str]:
+                nchans: int | None = None, stats: dict | None = None) -> list[str]:
     """Plain-language lines: where we are in the file, what was seen, and the verdict."""
     import pandas as pd
     lines = []
@@ -156,6 +256,12 @@ def explain_run(cands, snr_threshold: float, rng: tuple[int, int] | None = None,
         else:
             line += "; this file is finished."
         lines.append(line)
+    if stats and (stats.get("spikes") or stats.get("pulses")):
+        # Secondary detectors (B37): spikes on a known tone are dropped; say what is left.
+        lines.append(f"Also: {stats.get('spikes', 0):,} lone spike(s) (single bright samples, "
+                     f"not part of any tone) and {stats.get('pulses', 0):,} broadband pulse(s), "
+                     f"{stats.get('pulses_undispersed', 0):,} of them undispersed, so from Earth. "
+                     "See spikes.csv / pulses.csv.")
     if cands.empty:
         lines.append(f"Nothing rose above the noise (SNR {snr_threshold:g}). That is the usual result.")
         return lines
@@ -172,10 +278,13 @@ def explain_run(cands, snr_threshold: float, rng: tuple[int, int] | None = None,
         lines.append("Verdict: nothing here needs follow-up; everything has an ordinary explanation.")
     else:
         b = survivors.iloc[0]
+        tested = b.get("cadence") == "passed"
         lines.append(f"Verdict: {len(survivors):,} signal(s) passed every automatic check. Best: "
                      f"{b['frequency_mhz']:.6f} MHz, drifting {b['drift_rate_hz_s']:+.3f} Hz/s, "
-                     f"interest {b['interest']:.0f}/100. Still unverified until an ON/OFF cadence "
-                     "check and a re-observation.")
+                     f"interest {b['interest']:.0f}/100. "
+                     + ("It also passed the ON/OFF cadence; it needs a re-observation."
+                        if tested else "Still unverified until an ON/OFF cadence check and a "
+                                       "re-observation."))
     return lines
 
 
@@ -280,8 +389,9 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
            watch_dir: Path = typer.Option(Path("data/raw"), help="Directory for --source local."),
            forever: bool = typer.Option(False, help="Keep polling for new data like a BOINC client."),
            poll_seconds: int = typer.Option(600),
-           max_units: int = typer.Option(0, help="Crunch at most N units per observation per "
-                                         "run; the next run continues where this one stopped."),
+           max_units: int = typer.Option(None, help="Crunch at most N units per observation per "
+                                         "visit; the next visit continues where this one stopped. "
+                                         "Default: whole files, or 128 (~2 GB) with --forever."),
            outdir: Path = typer.Option(Path("reports/crunch")),
            state: Path = typer.Option(Path("data/state.json")),
            workers: int = typer.Option(None), snr: float = typer.Option(None),
@@ -290,6 +400,9 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
                                            "that pass the gate to the configured share_to sinks."),
            retry_failed: bool = typer.Option(False, help="Forget recorded failures and try "
                                              "those files again (e.g. after an update)."),
+           cadence: bool = typer.Option(True, help="For archive scans of a cadence's target, also "
+                                        "search the same channels in its other scans and run the "
+                                        "ON/OFF test (about 6x the work per run)."),
            include_unresolvable: bool = typer.Option(
                False, help="Also crunch products whose channels are too wide to measure drift "
                            "(BL mid-res .0002). Skipped by default: ~2 min each, never shareable."),
@@ -300,12 +413,17 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
         LocalSource,
         SetiAtHomeSource,
         SyntheticSource,
+        cadence_siblings,
         drift_resolvable,
         unit_too_large,
     )
     from .state import MAX_ATTEMPTS, Ledger
     cfg = _cfg(config, workers, snr)
     ledger = Ledger.load(state)
+    if max_units is None:
+        # A high-res file is 64 GB (~2 h at ~8 MB/s): --forever takes it in ~2 GB visits so
+        # work is saved often and new targets keep coming in (backlog B44).
+        max_units = FOREVER_MAX_UNITS if forever else 0
     from .pipeline import SCORING_VERSION
     if old := ledger.drop_stale_best(SCORING_VERSION):
         print(f"[dim]Lifetime best (interest {old.get('interest')}) was scored under older rules "
@@ -315,7 +433,7 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
         ledger.failed.clear()
 
     if source == "auto":
-        s = SetiAtHomeSource.probe()
+        s = ledger.seti_at_home_status(lambda: SetiAtHomeSource.probe(timeout=5.0))
         print(f"SETI@home server: {s['detail']}")
         if s["distributing"]:
             print("[yellow]SETI@home is sending work again: run the official BOINC client to "
@@ -333,8 +451,11 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
     else:
         raise typer.BadParameter(f"Unknown source {source}")
 
+    n_pass = 0
     while True:
         n_new = n_failed = 0
+        n_pass += 1
+        t_pass, mb_pass = time.time(), 0.0
         for location, kind, header, meta in src.observations(ledger.skip(), set(ledger.progress)):
             if kind == "error":
                 n_failed += 1
@@ -355,6 +476,7 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
                 print(f"[yellow]skip[/yellow] {Path(key).name}: {too_large}")
                 continue
             n_new += 1
+            print(f"\n[bold]Pass {n_pass} · file {n_new}[/bold]")
             stem = Path(str(location).split("?")[0]).stem
             print(f"\n[bold #36c2b4]New work:[/bold #36c2b4] {meta.get('target')}  {stem}  "
                   f"({header.f_min:.3f}–{header.f_max:.3f} MHz, {header.nchans:,} ch)")
@@ -363,10 +485,13 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
             report_dir = outdir / (f"{stem}_ch{rng[0]}-{rng[1]}" if partial else stem)
             if partial:
                 print(f"Channels {rng[0]:,}–{rng[1]:,} of {header.nchans:,}")
+            sibs = cadence_siblings(key) if cadence and kind == "remote" else None
             cands, stats = crunch_observation(location, kind, header, meta, cfg, report_dir,
-                                              live, ledger, chan_range=rng)
+                                              live, ledger, chan_range=rng, cadence=sibs)
+            mb_pass += ((rng[1] - rng[0]) * header.nsamples * header.nifs
+                        * header.bytes_per_value / 2**20)
             _summary(cands, stats, report_dir, n=5)
-            for line in explain_run(cands, cfg.snr_threshold, rng, header.nchans):
+            for line in explain_run(cands, cfg.snr_threshold, rng, header.nchans, stats):
                 print(line)
             if auto_share and not cands.empty:
                 _share_run(report_dir, cfg, cfg.share_to, ledger, cfg.share_top,
@@ -377,6 +502,11 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
             else:
                 ledger.advance(key, rng[1], header.nchans)
             ledger.save()
+        took = time.time() - t_pass
+        print(f"[bold]Pass {n_pass} done:[/bold] {n_new} file(s), ~{mb_pass:,.0f} MB in "
+              f"{took // 60:.0f}m{took % 60:02.0f}s"
+              + (f" ({mb_pass / took:.1f} MB/s)" if took > 0 and mb_pass else "")
+              + (f"; {len(ledger.progress)} file(s) partly searched" if ledger.progress else ""))
         gave_up = sum(v["attempts"] >= MAX_ATTEMPTS for v in ledger.failed.values())
         print(f"{n_new} crunched, {n_failed} failed or skipped this pass; {gave_up} file(s) set "
               f"aside for good (unsearchable here, or failed {MAX_ATTEMPTS} times; see 'failed' "
@@ -385,7 +515,12 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
             if n_new == 0:
                 print("No new observations matched. Try another --target or --source.")
             break
-        print(f"[dim]Waiting {poll_seconds}s for new data…[/dim]")
+        if n_new:
+            # Work may be waiting (partly searched files, more archive rows): don't idle (B38).
+            print("[dim]Continuing at once: there may be more work waiting.[/dim]")
+            continue
+        print(f"[dim]Nothing new this pass; next poll in {poll_seconds // 60}:"
+              f"{poll_seconds % 60:02d}.[/dim]")
         time.sleep(poll_seconds)
     print(f"Lifetime: {ledger.work_units:,} work units, {ledger.channels:,} channels, "
           f"{ledger.cpu_seconds / 3600:.2f} CPU-hours. Best interest so far: "

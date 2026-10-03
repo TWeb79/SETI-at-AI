@@ -11,7 +11,9 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 CLASSES = ["technosignature_like", "rfi_zero_drift", "rfi_wideband",
-           "rfi_nonlinear", "rfi_intermittent"]
+           "rfi_nonlinear", "rfi_intermittent", "rfi_strong_carrier"]
+# The interference kinds the demo hides among its ET-like tones (weights in synthetic_observation).
+DEMO_RFI = ("rfi_zero_drift", "rfi_wideband", "rfi_nonlinear", "rfi_intermittent")
 
 
 @dataclass
@@ -86,8 +88,17 @@ def random_injection(kind: str, n_time: int, n_chan: int, rng: np.random.Generat
     start = float(rng.uniform(margin, n_chan - margin))
     snr = float(rng.uniform(*snr_range))
     if kind == "technosignature_like":
-        drift = float(rng.uniform(0.05, max_drift)) * rng.choice([-1, 1])
+        # Log-uniform from two search steps (one step is within the noise of zero drift, B36)
+        # up to the cap, so slow and fast drifts are equally well represented (B3).
+        lo = min(2.0 / max(n_time - 1, 1), max_drift)
+        drift = float(np.exp(rng.uniform(np.log(lo), np.log(max_drift)))) * rng.choice([-1, 1])
         return Injection(kind, start, drift, snr, float(rng.uniform(0.5, 2.0)))
+    if kind == "rfi_strong_carrier":
+        # A bright, steady, slowly drifting transmitter: the commonest real RFI, and the one
+        # the classifier used to call technosignature_like with p = 1 (former B8).
+        bright = float(np.exp(rng.uniform(np.log(10.0), np.log(1000.0))))
+        return Injection(kind, start, float(rng.uniform(-0.3, 0.3)), bright,
+                         float(rng.uniform(0.5, 2.0)))
     if kind == "rfi_zero_drift":
         return Injection(kind, start, 0.0, snr, float(rng.uniform(0.5, 3.0)))
     if kind == "rfi_wideband":
@@ -113,7 +124,7 @@ def synthetic_observation(n_time: int = 16, n_chan: int = 1 << 20, seed: int = 4
     injections: list[Injection] = []
     k = abs(4.0 * tsamp / (foff * 1e6))
     for _ in range(n_rfi):
-        kind = rng.choice(CLASSES[1:], p=[0.45, 0.2, 0.15, 0.2])
+        kind = rng.choice(DEMO_RFI, p=[0.45, 0.2, 0.15, 0.2])
         injections.append(random_injection(str(kind), n_time, n_chan, rng,
                                            snr_range=(2.0, 12.0), max_drift=min(k, 6)))
     for _ in range(n_et):

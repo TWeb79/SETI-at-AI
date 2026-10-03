@@ -2,6 +2,7 @@
 import http.server
 import json
 import threading
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -576,3 +577,208 @@ def test_new_files_keep_half_the_limit_when_others_are_resumed(monkeypatch):
     only_resumed = BreakthroughListenSource(limit=4).new_rows(
         {r["url"] for r in archive[6:]}, partial)          # nothing new left: all slots resume
     assert len(only_resumed) == 4
+
+
+def test_cadence_siblings_reads_the_archive_folder(monkeypatch):
+    """B7: the archive has no cadence link; the folder listing is the cadence."""
+    import ai_seti.io.remote as remote
+    from ai_seti.sources import cadence_siblings
+
+    names = ["57774_77504_LHS1140_0003", "57774_77843_HIP2579_0004", "57774_78182_LHS1140_0005",
+             "57774_78521_HIP2586_0006", "57774_78860_LHS1140_0007", "57774_79193_HIP3249_0008"]
+    listing = "".join(f'<a href="spliced_blc00_guppi_{n}.gpuspec.{p}.fil">x</a>'
+                      for n in names for p in ("0000", "0002"))
+    monkeypatch.setattr(remote, "_get", lambda url, **k: (listing.encode(), {}, 200))
+    scans = cadence_siblings("http://h/LHS1140/C/spliced_blc00_guppi_57774_78182_LHS1140_0005"
+                             ".gpuspec.0000.fil")
+    assert [s["target"] for s in scans] == ["LHS1140", "HIP2579", "LHS1140", "HIP2586",
+                                            "LHS1140", "HIP3249"]
+    assert [s["is_on"] for s in scans] == [True, False, True, False, True, False]
+    assert all(s["url"].endswith(".gpuspec.0000.fil") for s in scans), "same product only"
+    monkeypatch.setattr(remote, "_get", lambda url, **k: (b"<a href='lone.fil'>", {}, 200))
+    assert cadence_siblings("http://h/X/spliced_guppi_57774_1_A_0001.gpuspec.0000.fil") == []
+
+
+def test_crunch_cadence_passes_on_only_tone_and_fails_everywhere_tone(tmp_path):
+    """B7: a tone only in ON scans passes; one also seen pointing away fails and drops."""
+    import numpy as _np
+
+    from ai_seti.ai.simulate import Injection, inject, noise_waterfall
+    from ai_seti.cli import crunch_observation
+    from ai_seti.config import SearchConfig
+    from ai_seti.io.filterbank import FilterbankHeader, read_header, write_sigproc
+
+    cfg = SearchConfig(channels_per_unit=16384, workers=1, use_ai=False)
+    cadence = []
+    for i, (target, on) in enumerate([("STAR", True), ("OFF1", False), ("STAR", True),
+                                      ("OFF2", False)]):
+        rng = _np.random.default_rng(i)
+        d = noise_waterfall(16, 16384, rng)
+        inject(d, Injection("technosignature_like", 9000.0, 1.5, 8.0, 1.0), rng)   # RFI: all scans
+        if on:
+            inject(d, Injection("technosignature_like", 4000.0, 2.5, 8.0, 1.0), rng)  # ON only
+        path = tmp_path / f"{i}_{target}.fil"
+        write_sigproc(path, d, FilterbankHeader(fch1=1420.0, foff=-2.7939677238464355e-06,
+                                                nchans=16384, tsamp=18.25, nsamples=16,
+                                                source_name=target))
+        cadence.append({"url": str(path), "target": target, "mjd": 60000.0 + i * 1e-5,
+                        "kind": "local", "is_on": on})
+    me = cadence[0]["url"]
+    cands, _ = crunch_observation(me, "local", read_header(Path(me)), {"target": "STAR"}, cfg,
+                                  tmp_path / "out", live=False, cadence=cadence)
+    near = lambda c: cands[(cands["channel"] - c).abs() <= 3].iloc[0]  # noqa: E731
+    assert near(4000)["cadence"] == "passed"
+    assert near(9000)["cadence"] == "failed"
+    assert near(9000)["interest"] < near(4000)["interest"]
+    off_cands, _ = crunch_observation(cadence[1]["url"], "local", read_header(Path(cadence[1]["url"])),
+                                      {"target": "OFF1"}, cfg, tmp_path / "out2", live=False,
+                                      cadence=cadence)
+    assert (off_cands["cadence"] == "untestable").all(), "an OFF pointing can't be tested"
+
+
+def test_forever_only_sleeps_when_a_pass_found_nothing(tmp_path, monkeypatch):
+    """B38: --forever slept 15 min after every pass, with hundreds of files waiting."""
+    from typer.testing import CliRunner
+
+    import ai_seti.cli as cli
+    import ai_seti.sources as sources
+    from ai_seti.io.filterbank import FilterbankHeader
+
+    hdr = FilterbankHeader(fch1=1420.0, foff=-2.7939677238464355e-06, nchans=1024,
+                           tsamp=18.25, nsamples=16)
+    work = ["http://x/a.fil", "http://x/b.fil"]          # one file per pass, then nothing
+
+    class _Src:
+        def __init__(self, *a, **k):
+            pass
+
+        def observations(self, done, partial=frozenset()):
+            for u in work:
+                if u not in done:
+                    yield u, "remote", hdr, {"url": u}
+                    return
+
+    sleeps = []
+
+    def fake_sleep(sec):
+        sleeps.append(sec)
+        raise KeyboardInterrupt                           # end the endless loop here
+
+    import pandas as _pd
+    monkeypatch.setattr(sources, "BreakthroughListenSource", _Src)
+    monkeypatch.setattr(sources, "cadence_siblings", lambda url: [])
+    monkeypatch.setattr(cli, "crunch_observation", lambda *a, **k: (
+        _pd.DataFrame(), {"work_units": 1, "channels": 1024, "wall_seconds": 1.0, "workers": 1}))
+    monkeypatch.setattr(cli.time, "sleep", fake_sleep)
+    res = CliRunner().invoke(cli.app, ["crunch", "--source", "bl", "--forever", "--state",
+                                       str(tmp_path / "s.json"), "--no-live", "--poll-seconds", "900"])
+    assert res.exit_code == 130, res.output         # the KeyboardInterrupt ended the loop
+    assert sleeps == [900], "two passes with work, no sleep; the empty third pass sleeps once"
+    assert set(Ledger.load(tmp_path / "s.json").observations_done) == set(work), res.output
+
+
+def test_seti_at_home_probe_is_cached_for_a_day(tmp_path):
+    """B43: every crunch start waited out the probe's timeout on an unreachable server."""
+    from datetime import UTC, datetime, timedelta
+
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return {"reachable": False, "distributing": False, "detail": "unreachable"}
+
+    led = Ledger(path=tmp_path / "s.json")
+    led.seti_at_home_status(probe)
+    led.save()
+    Ledger.load(tmp_path / "s.json").seti_at_home_status(probe)       # next start: cached
+    assert len(calls) == 1
+    old = Ledger.load(tmp_path / "s.json")
+    old.sah_status["at"] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    old.seti_at_home_status(probe)                                      # a day later: probe again
+    assert len(calls) == 2
+
+
+def test_forever_takes_files_in_bounded_visits(tmp_path, monkeypatch):
+    """B44: --forever streamed whole 64 GB files (~2 h) per visit by default."""
+    from typer.testing import CliRunner
+
+    import ai_seti.cli as cli
+    import ai_seti.sources as sources
+    from ai_seti.config import SearchConfig
+    from ai_seti.io.filterbank import FilterbankHeader
+
+    big = FilterbankHeader(fch1=8001.0, foff=-2.7939677238464355e-06, nchans=1 << 30,
+                           tsamp=18.25, nsamples=16)
+
+    class _Src:
+        def __init__(self, *a, **k):
+            pass
+
+        def observations(self, done, partial=frozenset()):
+            if "http://x/big.fil" not in partial:
+                yield "http://x/big.fil", "remote", big, {"url": "http://x/big.fil"}
+
+    ranges = []
+    monkeypatch.setattr(sources, "BreakthroughListenSource", _Src)
+    monkeypatch.setattr(sources, "cadence_siblings", lambda url: [])
+    monkeypatch.setattr(cli, "crunch_observation", lambda *a, **k: (
+        ranges.append(k["chan_range"]) or __import__("pandas").DataFrame(),
+        {"work_units": 1, "channels": 1, "wall_seconds": 1.0, "workers": 1}))
+    monkeypatch.setattr(cli.time, "sleep", lambda s: (_ for _ in ()).throw(KeyboardInterrupt))
+    CliRunner().invoke(cli.app, ["crunch", "--source", "bl", "--forever", "--no-live",
+                                 "--state", str(tmp_path / "s.json")])
+    assert ranges == [(0, cli.FOREVER_MAX_UNITS * SearchConfig().channels_per_unit)]
+
+
+def test_cadence_reuses_scans_already_searched(tmp_path, monkeypatch):
+    """B41: cadence steps re-downloaded every sibling, and OFF scans were downloaded again."""
+    import numpy as _np
+
+    import ai_seti.pipeline as pipeline
+    from ai_seti.ai.simulate import Injection, inject, noise_waterfall
+    from ai_seti.cli import crunch_observation
+    from ai_seti.config import SearchConfig
+    from ai_seti.io.filterbank import FilterbankHeader, read_header, write_sigproc
+
+    cfg = SearchConfig(channels_per_unit=16384, workers=1, use_ai=False)
+    cadence = []
+    for i, (target, on) in enumerate([("STAR", True), ("OFF1", False), ("STAR", True),
+                                      ("OFF2", False)]):
+        path = tmp_path / f"{i}_{target}.fil"
+        rng = _np.random.default_rng(i)
+        data = noise_waterfall(16, 16384, rng)
+        inject(data, Injection("technosignature_like", 4000.0, 2.5, 8.0, 1.0), rng)
+        write_sigproc(path, data,
+                      FilterbankHeader(fch1=1420.0, foff=-2.7939677238464355e-06, nchans=16384,
+                                       tsamp=18.25, nsamples=16, source_name=target))
+        cadence.append({"url": str(path), "target": target, "mjd": 60000.0 + i * 1e-5,
+                        "kind": "local", "is_on": on})
+    searches = []
+    real = pipeline.run_units
+    monkeypatch.setattr(pipeline, "run_units",
+                        lambda units, *a, **k: searches.append(units[0].location) or real(units, *a, **k))
+    ledger = Ledger(path=tmp_path / "state.json")
+    # ON scan 1: itself + 3 siblings (4). ON scan 2: everything cached (still 4). The OFF scan
+    # crunched on its own later: also cached, no download (still 4).
+    for n, idx in ((4, 0), (4, 2), (4, 1)):
+        url = cadence[idx]["url"]
+        crunch_observation(url, "local", read_header(Path(url)), {"target": "STAR"}, cfg,
+                           tmp_path / f"out{idx}", live=False, ledger=ledger,
+                           chan_range=(0, 16384), cadence=cadence)
+        assert len(searches) == n, searches
+
+
+def test_crunch_prints_plain_progress_status(tmp_path):
+    """B39: without the live dashboard, say which file, which phase, and how the pass went."""
+    from typer.testing import CliRunner
+
+    from ai_seti.cli import app
+
+    res = CliRunner().invoke(app, ["crunch", "--source", "synthetic", "--limit", "1",
+                                   "--state", str(tmp_path / "s.json"), "--outdir",
+                                   str(tmp_path / "out"), "--no-live", "--workers", "1"])
+    assert res.exit_code == 0, res.output
+    out = " ".join(res.output.split())
+    for expected in ("Pass 1 · file 1", "reading and analysing 1 work unit(s)", "MB in",
+                     "analysed in", "Pass 1 done: 1 file(s)"):
+        assert expected in out, expected

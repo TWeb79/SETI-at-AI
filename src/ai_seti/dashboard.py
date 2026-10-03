@@ -52,7 +52,7 @@ class CrunchDashboard:
         self.hits += len(result.get("hits", []))
         for h in result.get("hits", []):
             score = h.get("p_technosignature_like", 0) or 0
-            key = (0 if h.get("zero_drift") else 1, score, h["snr"])
+            key = (0 if h.get("stationary", h.get("zero_drift")) else 1, score, h["snr"])
             if self.best is None or key > self.best["_key"]:
                 self.best = {**h, "_key": key}
         self.status = f"crunched {result['unit_id']}"

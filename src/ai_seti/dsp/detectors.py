@@ -30,6 +30,24 @@ def find_spikes(z: np.ndarray, threshold: float = 9.0, max_spikes: int = 200,
     return out
 
 
+def isolated_spikes(spikes: list[dict], hits, tol_ch: float = 3.0) -> list[dict]:
+    """Spikes that are not just a sample of a tone the de-Doppler search already found.
+
+    A strong carrier exceeds the spike threshold in every sample, so on real data nearly all
+    raw spikes sit on a known hit's track (backlog B37). Only the rest are news.
+    """
+    if not spikes or hits is None or len(hits) == 0:
+        return spikes
+    start = hits["channel"].to_numpy(dtype=float)
+    drift = hits["drift_ch_per_step"].to_numpy(dtype=float)
+    # A broad tone's wings are part of it too: widen the margin by each hit's own width.
+    width = (hits["bandwidth_ch"].to_numpy(dtype=float) if "bandwidth_ch" in hits
+             else np.zeros(len(start)))
+    return [s for s in spikes
+            if not np.any(np.abs(start + drift * s["time_index"] - s["channel"])
+                          <= tol_ch + width)]
+
+
 def find_pulses(z: np.ndarray, freqs_mhz: np.ndarray, tsamp: float,
                 threshold: float = 8.0, max_dm: float = 1000.0, n_dm: int = 64,
                 widths=(1, 2, 4, 8, 16), nsub: int = 64, min_samples: int = 32,

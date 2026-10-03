@@ -93,6 +93,28 @@ def flag_multi_target(df: pd.DataFrame, seen: list, target: str, tol_khz: float 
     return df.sort_values("interest", ascending=False).reset_index(drop=True)
 
 
+def apply_cadence(df: pd.DataFrame, status: str, events: pd.DataFrame | None = None,
+                  tol_hz: float = 50.0) -> pd.DataFrame:
+    """Write the ON/OFF result onto each hit as `cadence` (backlog B7).
+
+    `status` is "tested" (use `events` from `cadence_filter`), "untestable" (this scan is an
+    OFF pointing, or there aren't enough scans) or "not_run". A tested hit that is not among
+    the events failed: it showed up when pointing away, or not in every ON scan. That is the
+    strongest interference evidence there is, so it keeps a fifth of its interest.
+    """
+    if status != "tested":
+        df["cadence"] = status
+        return df
+    ev = (events["frequency_mhz"].to_numpy(dtype=float) if events is not None and not events.empty
+          else np.empty(0))
+    f = df["frequency_mhz"].to_numpy(dtype=float)
+    passed = (np.abs(f[:, None] - ev[None, :]) <= tol_hz / 1e6).any(axis=1) if ev.size else \
+        np.zeros(len(df), dtype=bool)
+    df["cadence"] = np.where(passed, "passed", "failed")
+    df["interest"] = np.where(passed, df["interest"], (df["interest"] * 0.2).round(1))
+    return df.sort_values("interest", ascending=False).reset_index(drop=True)
+
+
 def is_off_scan(name: str) -> bool:
     return "_OFF" in name.upper()
 
@@ -115,7 +137,8 @@ def cadence_is_testable(scans: list[dict], min_on_scans: int = 2) -> tuple[bool,
 
 
 def cadence_filter(scans: list[dict], min_on_fraction: float = 1.0,
-                   freq_tol_hz: float = 20.0, min_on_scans: int = 2) -> pd.DataFrame:
+                   freq_tol_hz: float = 20.0, min_on_scans: int = 2,
+                   reference: str | None = None) -> pd.DataFrame:
     """scans: [{'name', 'mjd', 'is_on', 'hits': DataFrame(frequency_mhz, drift_rate_hz_s, snr)}].
 
     Returns events from the first ON scan that (a) re-appear along the extrapolated
@@ -132,7 +155,10 @@ def cadence_filter(scans: list[dict], min_on_fraction: float = 1.0,
     ons = [s for s in scans if s["is_on"]]
     if not ons or ons[0]["hits"].empty:
         return pd.DataFrame()
-    ref = ons[0]
+    # Events are this scan's hits; by default the first ON scan, or the one named `reference`.
+    ref = next((s for s in ons if s["name"] == reference), ons[0])
+    if ref["hits"].empty:
+        return pd.DataFrame()
     t0 = ref["mjd"]
     events = []
     for _, hit in ref["hits"].iterrows():
