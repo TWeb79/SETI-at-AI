@@ -33,7 +33,8 @@ import pandas as pd
 from . import __version__
 
 SCHEMA = "ai-seti-finding/1"
-CONFIG_KEYS = ("snr_threshold", "max_drift_rate_hz_s", "channels_per_unit", "bandpass_block")
+CONFIG_KEYS = ("snr_threshold", "max_drift_rate_hz_s", "max_drift_ch_per_step", "channels_per_unit",
+               "bandpass_block")
 
 
 # --------------------------------------------------------------------------- records

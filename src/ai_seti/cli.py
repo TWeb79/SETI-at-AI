@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
                        live: bool = True, ledger=None, chan_range=None):
     """Split -> parallel process (with live dashboard) -> score -> write outputs."""
     from .dashboard import CrunchDashboard
-    from .pipeline import run_units, score_candidates
+    from .pipeline import SCORING_VERSION, run_units, score_candidates
     from .report import write_outputs
     from .sources import drift_resolvable, split
 
@@ -59,15 +60,23 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
             results.append(res)
             dash.update(res)
             best = max((h["snr"] for h in res.get("hits", [])), default=0)
-            print(f"[dim]{dash.done}/{len(units)}[/dim] {res['unit_id']}  "
-                  f"hits={len(res.get('hits', []))}  best SNR={best:.1f}"
+            # Units run `n` at a time, so time left goes by batches, not by single units.
+            n = min(cfg.workers or os.cpu_count() or 1, len(units))
+            per_batch = (time.time() - t0) / -(-dash.done // n)
+            left = -(-(len(units) - dash.done) // n) * per_batch
+            a, b = (int(x) for x in res["unit_id"].rsplit(":", 1)[-1].split("-"))
+            chans = f"{a:,}–{b:,}"
+            print(f"[dim]{dash.done}/{len(units)} ({100 * dash.done // len(units)}%, "
+                  f"~{left:.0f} s left)[/dim]  channels {chans}  "
+                  f"signals={len(res.get('hits', []))}  strongest SNR={best:,.1f}"
                   + (f"  [red]{res['error']}[/red]" if res.get("error") else ""))
     wall = time.time() - t0
     cands = score_candidates(results, cfg)
     target = str(meta.get("target") or header.source_name)
     if ledger is not None and not cands.empty:
         from .rfi import flag_multi_target
-        cands = flag_multi_target(cands, ledger.signals, target)
+        cands = flag_multi_target(cands, ledger.signals, target, cfg.multi_target_tol_khz,
+                                  cfg.multi_target_band_khz, cfg.multi_target_band_hits)
     title = f"AI-SETI search of {meta.get('target') or Path(str(location)).name}"
     stats = write_outputs(results, cands, outdir, cfg, title,
                           {"location": str(location), "observation": meta,
@@ -78,7 +87,8 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
         if not cands.empty:
             ledger.remember_signals(cands["frequency_mhz"], target)
         if not cands.empty and ledger.record_best({**cands.iloc[0].to_dict(),
-                                                   "location": str(location)}):
+                                                   "location": str(location)},
+                                                  SCORING_VERSION):
             print("[bold #ffcc33]New lifetime best signal![/bold #ffcc33]")
     return cands, stats
 
@@ -95,6 +105,78 @@ def _summary(cands, stats, outdir: Path, n: int = 8):
                   "–" if an != an else f"{an:.2f}", f"{r['interest']:.0f}")
     console.print(t)
     print(f"Report: {outdir / 'report.html'}")
+
+
+# Why a signal is set aside, strongest evidence first; each signal is counted once, under the
+# first reason that applies. The wording is for people who don't read SNR tables.
+SET_ASIDE = [
+    ("mirror_image", "receiver artefacts: mirror pairs around a channel centre"),
+    ("multi_target", "seen (or in a band busy with signals) at another star, so not from this one"),
+    ("known_rfi_band", "inside a band used by satellites or radio services"),
+    ("stationary", "do not drift, so almost certainly transmitted from Earth"),
+    ("out_of_distribution", "far stronger than anything the AI was trained on (strong transmitters)"),
+    ("drift_unresolved", "drift cannot be measured in this file's wide channels"),
+    ("ai_rfi", "shaped like interference, according to the AI"),
+    ("ai_noise", "probably just noise"),
+]
+
+
+def _set_aside_masks(cands) -> dict:
+    import pandas as pd
+    none = pd.Series(False, index=cands.index)
+
+    def flag(name: str):
+        return cands[name].fillna(False).astype(bool) if name in cands else none
+
+    cls = cands["ai_class"].astype(str) if "ai_class" in cands else pd.Series("", cands.index)
+    unresolved = flag("drift_unresolved")
+    return {
+        "mirror_image": flag("mirror_image"), "multi_target": flag("multi_target"),
+        "known_rfi_band": flag("known_rfi_band"),
+        "stationary": (cands["zero_drift"] > 0) & ~unresolved if "zero_drift" in cands else none,
+        "out_of_distribution": cls == "out_of_distribution",
+        "drift_unresolved": unresolved,
+        "ai_rfi": cls.str.startswith("rfi_"),
+        "ai_noise": cls == "noise",
+    }
+
+
+def explain_run(cands, snr_threshold: float, rng: tuple[int, int] | None = None,
+                nchans: int | None = None) -> list[str]:
+    """Plain-language lines: where we are in the file, what was seen, and the verdict."""
+    import pandas as pd
+    lines = []
+    if rng and nchans:
+        lo, hi = rng
+        line = (f"Progress in this file: channels {lo:,}–{hi:,} of {nchans:,} "
+                f"({100 * hi / nchans:.1f}% done)")
+        if hi < nchans:
+            runs = -(-(nchans - hi) // max(hi - lo, 1))
+            line += f"; about {runs:,} more run(s) like this to finish it."
+        else:
+            line += "; this file is finished."
+        lines.append(line)
+    if cands.empty:
+        lines.append(f"Nothing rose above the noise (SNR {snr_threshold:g}). That is the usual result.")
+        return lines
+    lines.append(f"Seen: {len(cands):,} signal(s) above the noise. Set aside:")
+    masks = _set_aside_masks(cands)
+    remaining = pd.Series(True, index=cands.index)
+    for key, text in SET_ASIDE:
+        hit = masks[key] & remaining
+        if hit.any():
+            lines.append(f"  {int(hit.sum()):>5,}  {text}")
+        remaining &= ~hit
+    survivors = cands[remaining]
+    if survivors.empty:
+        lines.append("Verdict: nothing here needs follow-up; everything has an ordinary explanation.")
+    else:
+        b = survivors.iloc[0]
+        lines.append(f"Verdict: {len(survivors):,} signal(s) passed every automatic check. Best: "
+                     f"{b['frequency_mhz']:.6f} MHz, drifting {b['drift_rate_hz_s']:+.3f} Hz/s, "
+                     f"interest {b['interest']:.0f}/100. Still unverified until an ON/OFF cadence "
+                     "check and a re-observation.")
+    return lines
 
 
 @app.command()
@@ -156,6 +238,10 @@ def analyze(path: str, outdir: Path = typer.Option(Path("reports/analysis")),
         if not Path(path).is_file():
             raise typer.BadParameter(f"File does not exist: {path}")
         hdr, kind = read_header(Path(path)), "local"
+    from .sources import unit_too_large
+    if reason := unit_too_large(hdr, cfg):
+        print(f"[red]Not searched:[/red] {reason}")
+        raise typer.Exit(1)
     rng = hdr.channel_range(f_start_mhz, f_stop_mhz)
     meta = {"target": hdr.source_name, "source": kind}
     cands, stats = crunch_observation(path, kind, hdr, meta, cfg, outdir, live, chan_range=rng)
@@ -202,12 +288,31 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
            live: bool = typer.Option(True),
            auto_share: bool = typer.Option(False, help="After each observation, share findings "
                                            "that pass the gate to the configured share_to sinks."),
+           retry_failed: bool = typer.Option(False, help="Forget recorded failures and try "
+                                             "those files again (e.g. after an update)."),
+           include_unresolvable: bool = typer.Option(
+               False, help="Also crunch products whose channels are too wide to measure drift "
+                           "(BL mid-res .0002). Skipped by default: ~2 min each, never shareable."),
            config: Path = CONFIG_OPT):
     """Auto-load new data and crunch it continuously, SETI@home style."""
-    from .sources import BreakthroughListenSource, LocalSource, SetiAtHomeSource, SyntheticSource
+    from .sources import (
+        BreakthroughListenSource,
+        LocalSource,
+        SetiAtHomeSource,
+        SyntheticSource,
+        drift_resolvable,
+        unit_too_large,
+    )
     from .state import MAX_ATTEMPTS, Ledger
     cfg = _cfg(config, workers, snr)
     ledger = Ledger.load(state)
+    from .pipeline import SCORING_VERSION
+    if old := ledger.drop_stale_best(SCORING_VERSION):
+        print(f"[dim]Lifetime best (interest {old.get('interest')}) was scored under older rules "
+              "and has been reset; the next run sets a new one.[/dim]")
+    if retry_failed and ledger.failed:
+        print(f"Retrying {len(ledger.failed)} previously failed file(s).")
+        ledger.failed.clear()
 
     if source == "auto":
         s = SetiAtHomeSource.probe()
@@ -230,18 +335,29 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
 
     while True:
         n_new = n_failed = 0
-        for location, kind, header, meta in src.observations(ledger.skip()):
+        for location, kind, header, meta in src.observations(ledger.skip(), set(ledger.progress)):
             if kind == "error":
                 n_failed += 1
                 ledger.fail(str(meta.get("url")), str(meta.get("error")))
                 ledger.save()
                 print(f"[red]skip[/red] {meta.get('url')}: {meta.get('error')}")
                 continue
+            key = str(meta.get("url") or location)
+            too_large = unit_too_large(header, cfg)
+            if not too_large and not include_unresolvable and not drift_resolvable(header, cfg):
+                too_large = (f"drift is not measurable in its {abs(header.foff) * 1e6:,.0f} Hz "
+                             "channels, so no hit could ever pass the drift check; use the "
+                             "high-resolution product, or --include-unresolvable.")
+            if too_large:
+                n_failed += 1
+                ledger.fail(key, too_large, permanent=True)
+                ledger.save()
+                print(f"[yellow]skip[/yellow] {Path(key).name}: {too_large}")
+                continue
             n_new += 1
             stem = Path(str(location).split("?")[0]).stem
             print(f"\n[bold #36c2b4]New work:[/bold #36c2b4] {meta.get('target')}  {stem}  "
                   f"({header.f_min:.3f}–{header.f_max:.3f} MHz, {header.nchans:,} ch)")
-            key = str(meta.get("url") or location)
             rng = ledger.next_range(key, header.nchans, max_units * cfg.channels_per_unit)
             partial = rng != (0, header.nchans)
             report_dir = outdir / (f"{stem}_ch{rng[0]}-{rng[1]}" if partial else stem)
@@ -250,6 +366,8 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
             cands, stats = crunch_observation(location, kind, header, meta, cfg, report_dir,
                                               live, ledger, chan_range=rng)
             _summary(cands, stats, report_dir, n=5)
+            for line in explain_run(cands, cfg.snr_threshold, rng, header.nchans):
+                print(line)
             if auto_share and not cands.empty:
                 _share_run(report_dir, cfg, cfg.share_to, ledger, cfg.share_top,
                            cfg.share_min_interest, None, True, False, cfg.share_require_cadence)
@@ -260,8 +378,9 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
                 ledger.advance(key, rng[1], header.nchans)
             ledger.save()
         gave_up = sum(v["attempts"] >= MAX_ATTEMPTS for v in ledger.failed.values())
-        print(f"{n_new} crunched, {n_failed} failed this pass; {gave_up} file(s) skipped after "
-              f"{MAX_ATTEMPTS} failed attempts (see 'failed' in {state}).")
+        print(f"{n_new} crunched, {n_failed} failed or skipped this pass; {gave_up} file(s) set "
+              f"aside for good (unsearchable here, or failed {MAX_ATTEMPTS} times; see 'failed' "
+              f"in {state}).")
         if not forever:
             if n_new == 0:
                 print("No new observations matched. Try another --target or --source.")

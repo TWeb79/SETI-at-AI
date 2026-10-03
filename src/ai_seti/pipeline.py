@@ -38,7 +38,7 @@ def _pool_cols(arr: np.ndarray, cols: int, fn=np.max) -> np.ndarray:
 def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
     from .ai.features import feature_vector, hit_features
     from .ai.model import LABELS, HitScorer
-    from .dsp.dedoppler import drift_search
+    from .dsp.dedoppler import drift_search, searched_drift_hz_s
     from .dsp.detectors import find_pulses, find_spikes
     from .dsp.preprocess import normalize
     from .sources import drift_resolvable
@@ -68,6 +68,9 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
                                  max_hits=cfg.max_hits_per_unit, freqs_mhz=freqs,
                                  use_gpu=cfg.use_gpu)
     timings["dedoppler"] = time.perf_counter() - t
+    n_t, n_f = z.shape
+    drift_searched = searched_drift_hz_s(n_t, n_f, hdr.tsamp, hdr.foff, cfg.max_drift_rate_hz_s,
+                                         cfg.max_drift_ch_per_step)
 
     t = time.perf_counter()
     spikes = find_spikes(z, cfg.spike_threshold, freqs_mhz=freqs)
@@ -105,7 +108,7 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
         "unit_id": wu.unit_id, "location": wu.location, "meta": wu.meta,
         "n_channels": wu.core_stop - wu.core_start, "n_time": int(z.shape[0]),
         "f_lo": float(min(freqs[lo], freqs[hi - 1])), "f_hi": float(max(freqs[lo], freqs[hi - 1])),
-        "timings": timings, "hits": rows,
+        "timings": timings, "hits": rows, "drift_searched_hz_s": drift_searched,
         "spikes": [s for s in spikes if wu.core_start <= s["channel"] < wu.core_stop][:50],
         "pulses": pulses,
         "thumb": _pool_cols(z[:, lo:hi], THUMB_COLS).round(2).tolist(),
@@ -151,6 +154,11 @@ def run_units(units: list[WorkUnit], cfg: SearchConfig, on_result=None,
             yield res
 
 
+# Bump when the interest score changes meaning (new flags, penalties, caps), so a lifetime
+# best recorded under older rules is not shown as if it were comparable (backlog B27).
+SCORING_VERSION = 2
+
+
 def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
     """Merge hits from all units, add anomaly + RFI flags, compute interest score."""
     from .ai.features import SCALAR_FEATURES
@@ -185,8 +193,10 @@ def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
     score *= np.where(df["known_rfi_band"], 0.5, 1.0)
     score *= np.where(df["bandwidth_ch"] > 8, 0.4, 1.0)
     score *= np.where(df["mirror_image"], 0.2, 1.0)
+    # Strong out-of-range carriers are usually terrestrial: demote them like a non-drifting
+    # tone so one never heads a quiet list (B28), and cap them until a cadence clears them.
+    score *= np.where(ood, 0.3, 1.0)
     df["interest"] = (100 * score).round(1)
-    # Strong out-of-range carriers are usually terrestrial; cap them until a cadence clears them.
     df["interest"] = df["interest"].where(~ood, df["interest"].clip(upper=50.0))
 
     prob_cols = [c for c in df.columns if c.startswith("p_")]

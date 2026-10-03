@@ -95,9 +95,10 @@ class FilterbankHeader:
 
 # --------------------------------------------------------------------------- SIGPROC
 
-def _read_string(buf: bytes, pos: int) -> tuple[str, int]:
+def _read_string(buf: bytes, pos: int, allow_empty: bool = False) -> tuple[str, int]:
     (n,) = struct.unpack_from("<i", buf, pos)
-    if not 0 < n < 256:
+    # Keys are never empty, but values can be: BL's .8.0001 products carry rawdatafile="".
+    if not (0 if allow_empty else 1) <= n < 256:
         raise ValueError("Corrupt SIGPROC header string")
     pos += 4
     return buf[pos:pos + n].decode("ascii", errors="replace"), pos + n
@@ -131,7 +132,7 @@ def parse_sigproc_header(buf: bytes, file_size: int | None = None) -> Filterbank
             (values[key],) = struct.unpack_from("<d", buf, pos)
             pos += 8
         elif key in STRING_KEYS:
-            values[key], pos = _read_string(buf, pos)
+            values[key], pos = _read_string(buf, pos, allow_empty=True)
         else:
             raise ValueError(f"Unknown SIGPROC header key: {key!r}")
     nchans, nifs, nbits = values["nchans"], values.get("nifs", 1), values.get("nbits", 32)

@@ -23,20 +23,20 @@ coverage.xml
 htmlcov/
 .tox/
 
-# Runtime data: raw observations stay immutable and are never committed.
-# A Breakthrough Listen coarse channel is hundreds of MB; regenerable with `ai-seti demo`.
-data/raw/*
-data/processed/*
-data/candidates/*
-data/state.json
-data/bl/
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-!data/candidates/.gitkeep
+# Runtime data: observations, caches, the ledger (data/state.json) and anything else a run
+# writes under data/ is never committed; only the folder placeholders are. A Breakthrough
+# Listen coarse channel is hundreds of MB; everything here is regenerable or re-downloadable.
+data/**
+!data/**/
+!data/**/.gitkeep
 
-# Generated reports and share bundles (`share` writes bundles to reports/share).
-reports/*
+# Generated reports, candidate lists, plots and share bundles (reports/share).
+reports/**
+!reports/**/
 !reports/.gitkeep
+
+# Browser-automation artefacts
+.playwright-mcp/
 
 # Raw observation formats are ignored by extension, so a deliberate regression fixture
 # under tests/ would be swallowed too. Re-include them if fixtures are ever added.
@@ -61,7 +61,8 @@ configs/*.local.json
 *.log
 *.orig
 *.rej
-.streamlit/
+.streamlit/*
+!.streamlit/config.toml
 .DS_Store
 .idea/
 .vscode/

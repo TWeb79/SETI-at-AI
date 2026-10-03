@@ -18,10 +18,37 @@ Works with numpy or cupy (`xp`) — every op is array-API style.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 
 import numpy as np
 from scipy.ndimage import maximum_filter1d
+
+logger = logging.getLogger(__name__)
+
+# A channel of width foff integrates ~tsamp*foff spectra per sample; BL products span ~50-3,000.
+# Values far above that mean foff was passed in Hz where MHz is expected (backlog B2).
+MAX_TIME_BANDWIDTH = 1e6
+
+
+def _drift_limits(t: int, f: int, tsamp: float, foff_hz: float, max_drift_hz_s: float,
+                  max_ch_per_step: int | None) -> tuple[float, int, int]:
+    """(channels/step the rate needs, cap from config, cap after the window width)."""
+    k_needed = abs(max_drift_hz_s * tsamp / foff_hz) if foff_hz else 1
+    k_max = max(0, int(np.ceil(k_needed)) - 1)
+    if max_ch_per_step is not None:
+        k_max = min(k_max, max(0, max_ch_per_step - 1))
+    return k_needed, k_max, min(k_max, max(0, f // max(t, 1) - 1))
+
+
+def searched_drift_hz_s(t: int, f: int, tsamp: float, foff_mhz: float, max_drift_hz_s: float,
+                        max_ch_per_step: int | None = None) -> float:
+    """The drift rate a `drift_search` with these arguments actually covers (backlog B1)."""
+    foff_hz = abs(foff_mhz) * 1e6
+    if not foff_hz or not tsamp:
+        return max_drift_hz_s
+    _, _, k_max = _drift_limits(t, f, tsamp, foff_hz, max_drift_hz_s, max_ch_per_step)
+    return min(max_drift_hz_s, (k_max + 1) * foff_hz / tsamp)
 
 MAD_TO_SIGMA = 1.4826
 
@@ -137,11 +164,19 @@ def drift_search(z: np.ndarray, tsamp: float = 1.0, foff_mhz: float = 1e-6,
             xp = np
     t, f = z.shape
     foff_hz = foff_mhz * 1e6
-    k_needed = abs(max_drift_hz_s * tsamp / foff_hz) if foff_hz else 1
-    k_max = max(0, int(np.ceil(k_needed)) - 1)
-    if max_ch_per_step is not None:
-        k_max = min(k_max, max(0, max_ch_per_step - 1))
-    k_max = min(k_max, max(0, f // max(t, 1) - 1))
+    if abs(foff_hz) * tsamp > MAX_TIME_BANDWIDTH:
+        raise ValueError(
+            f"foff_mhz={foff_mhz:g} with tsamp={tsamp:g} s implies {abs(foff_hz) * tsamp:.3g} "
+            "spectra per sample; real filterbanks are ~1e2-1e4. foff_mhz must be in MHz "
+            "(was a channel width in Hz passed?)")
+    k_needed, k_cfg, k_max = _drift_limits(t, f, tsamp, foff_hz, max_drift_hz_s, max_ch_per_step)
+    if k_max < k_cfg:
+        # Not a configured cap: the window is too narrow for the drift it was asked to cover.
+        # Say so, rather than return "no hits" for drifts that were never looked at (B1).
+        logger.warning(
+            "Drift search degraded: a %d-channel window over %d samples reaches only %.3g Hz/s "
+            "of the requested %.3g Hz/s. Widen the work unit to search the full range.",
+            f, t, (k_max + 1) * abs(foff_hz) / tsamp, max_drift_hz_s)
 
     zx = xp.asarray(z, dtype=xp.float32)
     med, scale = _noise_scale(zx, xp)

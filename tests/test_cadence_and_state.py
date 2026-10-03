@@ -314,7 +314,7 @@ def test_failing_file_is_recorded_and_given_up_after_max_attempts(tmp_path, monk
         def __init__(self, *a, **k):
             pass
 
-        def observations(self, done):
+        def observations(self, done, partial=frozenset()):
             if "http://x/bad.fil" not in done:
                 fetched.append(1)
                 yield None, "error", None, {"url": "http://x/bad.fil", "error": "Corrupt header"}
@@ -328,7 +328,7 @@ def test_failing_file_is_recorded_and_given_up_after_max_attempts(tmp_path, monk
     assert len(fetched) == MAX_ATTEMPTS, "must stop retrying after MAX_ATTEMPTS"
     entry = Ledger.load(state).failed["http://x/bad.fil"]
     assert entry == {"attempts": MAX_ATTEMPTS, "reason": "Corrupt header"}
-    assert "1 file(s) skipped" in res.output
+    assert "1 file(s) set aside for good" in res.output
 
 
 def test_failed_work_unit_is_not_marked_searched(tmp_path, monkeypatch):
@@ -441,3 +441,138 @@ def test_status_distinguishes_empty_answer_from_working_archive(monkeypatch):
     assert asked["target"] and asked["timeout"] <= 10, "a real target, a short timeout"
     answer = []
     assert "returned no rows" in CliRunner().invoke(app, ["status"]).output
+
+
+def test_explain_run_counts_each_signal_once_and_gives_a_verdict():
+    import pandas as _pd
+
+    from ai_seti.cli import explain_run
+
+    cands = _pd.DataFrame({
+        "frequency_mhz": [1.0, 2.0, 3.0, 4.0], "drift_rate_hz_s": [0.1, 0.2, 0.0, 0.3],
+        "interest": [80.0, 60.0, 9.0, 5.0], "zero_drift": [0.0, 0.0, 1.0, 0.0],
+        "mirror_image": [False, True, True, False],          # row 2 is mirror AND stationary
+        "ai_class": ["technosignature_like", "technosignature_like", "rfi_zero_drift", "noise"]})
+    lines = explain_run(cands, 10.0, (0, 100), 400)
+    text = "\n".join(lines)
+    assert "25.0% done" in text and "about 3 more run(s)" in text
+    assert "    2  receiver artefacts" in text, "row 2 counted once, under its first reason"
+    assert "do not drift" not in text
+    assert "1 signal(s) passed every automatic check. Best: 1.000000 MHz" in text
+    assert explain_run(cands.iloc[0:0], 10.0)[-1].startswith("Nothing rose above the noise")
+
+
+def test_high_time_resolution_product_is_refused_once_not_crunched(tmp_path, monkeypatch):
+    """B12 follow-up: once the header parses, a .8.0001 file must not start a 27 GB unit."""
+    from typer.testing import CliRunner
+
+    import ai_seti.cli as cli
+    import ai_seti.sources as sources
+    from ai_seti.io.filterbank import FilterbankHeader
+    from ai_seti.state import MAX_ATTEMPTS
+
+    huge = FilterbankHeader(fch1=2251.4, foff=-0.18310546875, nchans=8192, tsamp=3.5e-4,
+                            nsamples=837_632, source_name="HIP2579")
+
+    class _Src:
+        def __init__(self, *a, **k):
+            pass
+
+        def observations(self, done, partial=frozenset()):
+            if "http://x/a.8.0001.fil" not in done:
+                yield "http://x/a.8.0001.fil", "remote", huge, {"url": "http://x/a.8.0001.fil"}
+
+    monkeypatch.setattr(sources, "BreakthroughListenSource", _Src)
+    monkeypatch.setattr(cli, "crunch_observation",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not crunch")))
+    state = tmp_path / "s.json"
+    res = CliRunner().invoke(cli.app, ["crunch", "--source", "bl", "--state", str(state),
+                                       "--no-live"])
+    assert res.exit_code == 0, res.output
+    entry = Ledger.load(state).failed["http://x/a.8.0001.fil"]
+    assert entry["attempts"] == MAX_ATTEMPTS and "High-time-resolution" in entry["reason"]
+
+
+def test_dashboard_is_as_tall_as_its_content_not_the_terminal():
+    """B15: a full-height Layout left ~15 blank lines behind when the live view stopped."""
+    from rich.console import Console
+
+    from ai_seti.dashboard import CrunchDashboard
+
+    console = Console(width=120, height=100, force_terminal=True)
+    with console.capture() as cap:
+        console.print(CrunchDashboard(4).render())
+    lines = cap.get().rstrip("\n").split("\n")
+    assert len(lines) < 40, f"rendered {len(lines)} lines on a 100-line terminal"
+
+
+def test_lifetime_best_from_older_scoring_is_dropped(tmp_path):
+    """B27: a best recorded before a scoring fix kept being shown as 'best so far'."""
+    from ai_seti.pipeline import SCORING_VERSION
+
+    led = Ledger(path=tmp_path / "s.json")
+    led.best = {"interest": 94.2, "frequency_mhz": 8000.34}          # no version: pre-B27
+    assert led.drop_stale_best(SCORING_VERSION)["interest"] == 94.2 and led.best == {}
+    assert led.record_best({"interest": 16.0}, SCORING_VERSION)
+    assert led.drop_stale_best(SCORING_VERSION) is None and led.best["interest"] == 16.0
+
+
+def test_hit_inside_another_targets_interference_comb_is_flagged():
+    """B21: real case, HIP2579 2234.783698 MHz sat 6 and 12 kHz from HIP2586's comb tones."""
+    import pandas as _pd
+
+    from ai_seti.rfi import flag_multi_target
+
+    hit = _pd.DataFrame({"frequency_mhz": [2234.783698, 1420.0], "interest": [70.0, 60.0]})
+    comb = [[2234.790138, "HIP2586"], [2234.795696, "HIP2586"]]
+    out = flag_multi_target(hit, comb, "HIP2579").set_index("frequency_mhz")
+    assert out.loc[2234.783698, "multi_target"] and out.loc[2234.783698, "interest"] == 14.0
+    assert not out.loc[1420.0, "multi_target"]
+    lone = flag_multi_target(hit, comb[:1], "HIP2579")       # one tone 6 kHz away: not a band
+    assert not lone["multi_target"].any()
+
+
+def test_crunch_skips_products_where_drift_is_unmeasurable(tmp_path):
+    """B19: mid-res files cost ~2 min each and can never pass the drift check; skip them."""
+    import json as _json
+
+    import numpy as _np
+    from typer.testing import CliRunner
+
+    from ai_seti.cli import app
+    from ai_seti.io.filterbank import FilterbankHeader, write_sigproc
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_sigproc(raw / "mid.fil", _np.ones((272, 2048), _np.float32), FilterbankHeader(
+        fch1=8001.46, foff=-2.86102294921875e-03, nchans=2048, tsamp=1.0737418239999998,
+        nsamples=272, source_name="HIP1"))
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"use_ai": False}))
+    base = ["crunch", "--source", "local", "--watch-dir", str(raw), "--outdir",
+            str(tmp_path / "out"), "--no-live", "--workers", "1", "--config", str(cfg)]
+    res = CliRunner().invoke(app, [*base, "--state", str(tmp_path / "a.json")])
+    assert res.exit_code == 0, res.output
+    assert "drift is not measurable" in Ledger.load(tmp_path / "a.json").failed[str(raw / "mid.fil")]["reason"]
+    assert not (tmp_path / "out" / "mid").exists(), "skipped, not crunched"
+    res = CliRunner().invoke(app, [*base, "--state", str(tmp_path / "b.json"), "--include-unresolvable"])
+    assert res.exit_code == 0, res.output
+    assert (tmp_path / "out" / "mid" / "candidates.csv").exists()
+
+
+def test_new_files_keep_half_the_limit_when_others_are_resumed(monkeypatch):
+    """B29: resumed (partly searched) files used to take every --limit slot."""
+    from ai_seti.sources import BreakthroughListenSource
+
+    archive = [{"url": f"http://x/{i}.fil"} for i in range(20)]
+    monkeypatch.setattr(BreakthroughListenSource, "query",
+                        lambda self, limit=None, **k: archive[:limit])
+    partial = {r["url"] for r in archive[:6]}            # the first six are half done
+    rows = BreakthroughListenSource(limit=4).new_rows(set(), partial)
+    urls = [r["url"] for r in rows]
+    assert len(urls) == 4
+    assert sum(u not in partial for u in urls) == 2, "two of four slots go to new files"
+    assert sum(u in partial for u in urls) == 2, "the rest continue resumed files"
+    only_resumed = BreakthroughListenSource(limit=4).new_rows(
+        {r["url"] for r in archive[6:]}, partial)          # nothing new left: all slots resume
+    assert len(only_resumed) == 4

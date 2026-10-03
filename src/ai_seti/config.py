@@ -36,6 +36,11 @@ class SearchConfig:
     anomaly_contamination: float = 0.05
     model_path: str | None = None           # default: bundled model
 
+    # --- interference seen at other targets (ledger, across runs) -----------------
+    multi_target_tol_khz: float = 2.0       # the same tone at another star
+    multi_target_band_khz: float = 25.0     # ...or a busy band there:
+    multi_target_band_hits: int = 2         # this many signals within ±band_khz
+
     # --- sharing findings back ------------------------------------------------
     share_to: list[str] = field(default_factory=lambda: ["bundle"])  # bundle | github | webhook
     share_min_interest: float = 70.0

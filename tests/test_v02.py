@@ -222,3 +222,12 @@ def test_symmetric_mirror_pair_flags_both_halves():
     assert out == {11192: True, 5192: True,       # symmetric pair: both are artefacts
                    30000: False, 2000: True,      # 10x unequal: only the image
                    50000: False}                  # no partner: untouched
+
+
+def test_sigproc_header_with_empty_string_value_parses(tmp_path):
+    """B12: BL .8.0001 files carry rawdatafile="" and were rejected as corrupt."""
+    p = tmp_path / "empty.fil"
+    write_sigproc(p, np.ones((4, 64), np.float32), FilterbankHeader(
+        fch1=1420.0, foff=-1e-3, nchans=64, tsamp=1.0, nsamples=4, source_name=""))
+    hdr = read_header(p)
+    assert hdr.source_name == "" and hdr.nchans == 64 and hdr.nsamples == 4

@@ -4,11 +4,11 @@ Each test names the defect it pins down, so a revert fails loudly rather than si
 reintroducing the behaviour. See implementationplan.md for the mapping.
 """
 
-import fnmatch
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ai_seti.ai.features import SCALAR_FEATURES
 from ai_seti.ai.model import LABELS, HitScorer, _sklearn_version
@@ -26,26 +26,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _would_be_ignored(rel_path: str) -> list[str]:
-    """Approximate gitignore matching; returns the patterns that exclude `rel_path`, or [].
+    """The .gitignore pattern that excludes `rel_path`, or [] if git would track it.
 
-    Later patterns win, as in git: a matching negation (`!`) re-includes the path, which is
-    what keeps the `.gitkeep` placeholders trackable under `reports/*` and `data/raw/*`. A
-    pattern matches when it covers the path or any ancestor directory.
+    Asks git itself (`check-ignore --no-index` evaluates the rules even for tracked files),
+    so `**` and negation behave exactly as they will on commit.
     """
-    parts = rel_path.split("/")
-    candidates = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
-    matched: list[str] = []
-    ignored = False
-    for raw in (PROJECT_ROOT / ".gitignore").read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        negate = line.startswith("!")
-        pattern = line.lstrip("!").rstrip("/")
-        if any(fnmatch.fnmatch(c, pattern) for c in candidates):
-            ignored = not negate
-            matched = [] if negate else [*matched, line]
-    return matched if ignored else []
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        pytest.skip("git not installed")
+    res = subprocess.run(["git", "check-ignore", "--no-index", "-v", rel_path],
+                         cwd=PROJECT_ROOT, capture_output=True, text=True)
+    if res.returncode != 0:
+        return []
+    pattern = res.stdout.split("\t")[0].split(":", 2)[2]
+    return [] if pattern.startswith("!") else [pattern]
 
 
 def test_bundled_model_artifact_is_not_gitignored():
@@ -161,6 +157,7 @@ def test_far_out_of_range_snr_is_not_trusted_as_technosignature():
     strong = cands[cands["snr"] == 10_000.0].iloc[0]
     normal = cands[cands["snr"] == 20.0].iloc[0]
     assert strong["ai_class"] == "out_of_distribution" and strong["interest"] <= 50
+    assert strong["interest"] <= 30, "B28: demoted like a stationary tone, not just capped"
     assert normal["ai_class"] == "technosignature_like" and normal["interest"] > 50
 
 
@@ -372,3 +369,24 @@ def test_training_shortfall_is_reported(monkeypatch, caplog):
         _, y = model.build_training_set(n_per_class=2, seed=0)
     assert (y == LABELS.index("noise")).sum() == 0
     assert "noise has 0 of 2" in caplog.text
+
+
+def test_foff_in_hz_is_rejected_not_silently_blinding():
+    """B2: Hz passed as MHz inflated foff a million-fold and returned 'no hits'."""
+    z = np.zeros((16, 1024), np.float32)
+    with pytest.raises(ValueError, match="must be in MHz"):
+        drift_search(z, tsamp=18.253611008, foff_mhz=2.7939677238464355)   # Hz, not MHz
+    drift_search(z, tsamp=18.253611008, foff_mhz=2.7939677238464355e-06)    # accepted
+
+
+def test_degraded_drift_search_warns_and_reports_what_it_covered(caplog):
+    """B1: a window too narrow for the requested drift must say so, not report 'nothing'."""
+    from ai_seti.dsp.dedoppler import searched_drift_hz_s
+
+    tsamp, foff_mhz = 18.253611008, 2.7939677238464355e-06   # 1 ch/step = 0.153 Hz/s
+    narrow = np.zeros((16, 64), np.float32)                   # reaches only 4 ch/step
+    with caplog.at_level("WARNING"):
+        drift_search(narrow, tsamp=tsamp, foff_mhz=foff_mhz, max_drift_hz_s=4.0)
+    assert "Drift search degraded" in caplog.text
+    assert searched_drift_hz_s(16, 64, tsamp, foff_mhz, 4.0) == pytest.approx(4 * 0.15306, rel=1e-3)
+    assert searched_drift_hz_s(16, 65536, tsamp, foff_mhz, 4.0) == 4.0, "a full window covers it all"

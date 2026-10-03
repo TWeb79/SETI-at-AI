@@ -9,7 +9,6 @@ import time
 
 import numpy as np
 from rich.console import Group
-from rich.layout import Layout
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -129,7 +128,7 @@ class CrunchDashboard:
         bar = Text("▮" * int(min(b["snr"], 60) / 2), style="#ff5a3c")
         return Group(t, bar)
 
-    def render(self) -> Layout:
+    def render(self) -> Group:
         frac = self.done / self.total if self.total else 0
         prog = Text()
         filled = int(frac * 50)
@@ -137,16 +136,18 @@ class CrunchDashboard:
         prog.append("░" * (50 - filled), style="#22306b")
         prog.append(f"  {frac * 100:5.1f}%   {self.status}", style="#b9b3a3")
 
-        lay = Layout()
-        lay.split_column(Layout(name="top", size=10), Layout(name="mid", size=9),
-                         Layout(name="wf", size=10), Layout(name="bar", size=3))
-        lay["top"].split_row(
-            Layout(Panel(self._info(), title="Data info", border_style="#3a4a8f")),
-            Layout(Panel(self._user(), title="User info", border_style="#3a4a8f")),
-            Layout(Panel(self._best(), title="Best signal so far", border_style="#ffcc33")),
+        # A Group is as tall as its content. A Layout fills the whole terminal and leaves
+        # ~15 blank lines behind when Live stops (backlog B15).
+        top = Table.grid(expand=True)
+        for _ in range(3):
+            top.add_column(ratio=1)
+        top.add_row(Panel(self._info(), title="Data info", border_style="#3a4a8f"),
+                    Panel(self._user(), title="User info", border_style="#3a4a8f"),
+                    Panel(self._best(), title="Best signal so far", border_style="#ffcc33"))
+        return Group(
+            top,
+            Panel(self._spectrum(), title="De-Doppler power spectrum (current unit)",
+                  border_style="#3a4a8f"),
+            Panel(self._waterfall(), title="Waterfall", border_style="#3a4a8f"),
+            Panel(prog, title=self.title, border_style="#36c2b4"),
         )
-        lay["mid"].update(Panel(self._spectrum(), title="De-Doppler power spectrum (current unit)",
-                                border_style="#3a4a8f"))
-        lay["wf"].update(Panel(self._waterfall(), title="Waterfall", border_style="#3a4a8f"))
-        lay["bar"].update(Panel(prog, title=self.title, border_style="#36c2b4"))
-        return lay

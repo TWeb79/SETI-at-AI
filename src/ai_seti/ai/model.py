@@ -152,14 +152,14 @@ class HitScorer:
                 self.model = None
                 self.load_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
-                    "Hit classifier at %s could not be loaded (%s). Hits will be reported "
-                    "unscored; interest falls back to the heuristic. Run `ai-seti train` "
+                    "Hit classifier at %s could not be loaded (%s). Hits will be labelled "
+                    "model_unavailable; interest falls back to the heuristic. Run `ai-seti train` "
                     "to rebuild the model for scikit-learn %s.",
                     self.path, self.load_error, _sklearn_version())
         else:
             self.load_error = f"model file not found: {self.path}"
             logger.warning(
-                "No hit classifier at %s. Hits will be unscored and interest will fall back "
+                "No hit classifier at %s. Hits will be labelled model_unavailable and interest falls back "
                 "to the heuristic. Run `ai-seti train` to create one.", self.path)
         self._cache[key] = (self.model, self.meta, self.load_error)
 

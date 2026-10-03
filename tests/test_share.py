@@ -74,6 +74,7 @@ def test_record_is_stable_private_and_gated(tmp_path):
     recs = build_findings(_report(tmp_path), top=5)
     assert len(recs) == 2
     r = recs[0]
+    assert "max_drift_ch_per_step" in r["processing"]["config"], "B17: the binding drift cap"
     assert r["status"] == "unverified_candidate"
     assert r["finding_id"] == finding_id(r["observation"], 1420.123456, 0.42)
     assert "secret" not in json.dumps(r)                    # local paths never leave

@@ -14,7 +14,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3    # a file that fails this often is skipped until the ledger is reset
-SIGNALS_PER_OBS = 50      # strongest candidates remembered per observation for B7
+SIGNALS_PER_OBS = 2000    # signals remembered per observation; weak comb tones matter (B21)
 # ponytail: flat list, capped; a sorted on-disk index if lifetime runs outgrow it.
 MAX_SIGNALS = 50_000
 
@@ -54,11 +54,20 @@ class Ledger:
         self.cpu_seconds += float(sum(result.get("timings", {}).values()))
         self.hits += len(result.get("hits", []))
 
-    def record_best(self, row: dict) -> bool:
+    def record_best(self, row: dict, scoring_version: int | None = None) -> bool:
         if row and row.get("interest", -1) > self.best.get("interest", -1):
             self.best = {k: v for k, v in row.items() if not str(k).startswith("_")}
+            if scoring_version is not None:
+                self.best["scoring_version"] = scoring_version
             return True
         return False
+
+    def drop_stale_best(self, scoring_version: int) -> dict | None:
+        """Forget a best signal scored under other rules; returns it so the caller can say so."""
+        if self.best and self.best.get("scoring_version") != scoring_version:
+            old, self.best = self.best, {}
+            return old
+        return None
 
     def done(self, obs: str) -> None:
         if obs not in self.observations_done:
@@ -69,9 +78,10 @@ class Ledger:
         self.signals += [[float(f), target] for f in list(freqs_mhz)[:SIGNALS_PER_OBS]]
         self.signals = self.signals[-MAX_SIGNALS:]
 
-    def fail(self, obs: str, reason: str) -> None:
+    def fail(self, obs: str, reason: str, permanent: bool = False) -> None:
+        """Record a failed attempt; `permanent` gives up at once (retrying cannot help)."""
         entry = self.failed.setdefault(obs, {"attempts": 0, "reason": ""})
-        entry["attempts"] += 1
+        entry["attempts"] = MAX_ATTEMPTS if permanent else entry["attempts"] + 1
         entry["reason"] = reason
 
     def skip(self) -> set[str]:

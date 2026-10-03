@@ -170,3 +170,13 @@ def test_robust_candidates_handles_three_dimensional_input():
     assert len(out) == 1 and out.iloc[0]["channel_index"] == 100
     assert out.iloc[0]["candidate_type"] == "persistent_narrowband_outlier"
     assert out.iloc[0]["status"] == "unverified"
+
+
+def test_web_ui_port_and_bind_address():
+    """B23/B24: project 61 -> 8061 (RULES_ports.md), and localhost only."""
+    import tomllib
+
+    cfg = tomllib.loads((PROJECT_ROOT / ".streamlit" / "config.toml").read_text())
+    assert cfg["server"]["port"] == 8061
+    assert cfg["server"]["address"] == "127.0.0.1"
+    assert "DASHBOARD_PORT=8061" in (PROJECT_ROOT / "ports.env").read_text()

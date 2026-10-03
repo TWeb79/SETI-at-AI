@@ -88,6 +88,9 @@ def write_outputs(results: list[dict], candidates: pd.DataFrame, outdir: Path, c
         "channels_per_second": round(channels / wall_seconds, 1) if wall_seconds else None,
         "stage_seconds": {k: round(v, 2) for k, v in stage.items()},
         "workers": len({r.get("pid") for r in results if r.get("pid")}),
+        # Smallest drift range any unit covered: below max_drift_rate_hz_s means a degraded run.
+        "drift_searched_hz_s": min((r["drift_searched_hz_s"] for r in results
+                                    if "drift_searched_hz_s" in r), default=None),
     }
     # Record a classifier failure in the report itself, so a run that quietly lost its
     # AI layer cannot be mistaken later for a run in which the AI layer found nothing.

@@ -67,25 +67,28 @@ def flag_mirror_images(df: pd.DataFrame, tol_ch: int = 3,
     return df
 
 
-MULTI_TARGET_TOL_MHZ = 0.002    # 2 kHz: covers a few Hz/s of drift between scans
-
-
-def flag_multi_target(df: pd.DataFrame, seen: list, target: str,
-                      tol_mhz: float = MULTI_TARGET_TOL_MHZ) -> pd.DataFrame:
-    """Flag hits already seen in a *different* target (backlog B7).
+def flag_multi_target(df: pd.DataFrame, seen: list, target: str, tol_khz: float = 2.0,
+                      band_khz: float = 25.0, band_hits: int = 2) -> pd.DataFrame:
+    """Flag hits seen, or sitting in an interference-busy band, at a *different* target.
 
     A signal present in several pointings cannot come from any one of them; it is the
     strongest interference evidence there is. `seen` is the ledger's [freq_mhz, target] list.
-    Flagged hits get `multi_target` and a fifth of their interest, then the frame is re-ranked.
+    A hit is flagged when another target had a signal within `tol_khz` (the same tone, B7), or
+    at least `band_hits` signals within ±`band_khz` (the same comb or forest, whose tones
+    land a few kHz apart from scan to scan, B21). Flagged hits get `multi_target` and a fifth
+    of their interest, then the frame is re-ranked.
     """
     df["multi_target"] = False
     other = np.array(sorted(f for f, t in seen if t != target), dtype=float)
     if df.empty or not len(other):
         return df
     f = df["frequency_mhz"].to_numpy(dtype=float)
-    i = np.clip(np.searchsorted(other, f), 1, len(other)) - 1
-    nearest = np.minimum(np.abs(other[i] - f), np.abs(other[np.minimum(i + 1, len(other) - 1)] - f))
-    df["multi_target"] = nearest <= tol_mhz
+
+    def within(khz: float) -> np.ndarray:
+        lo = np.searchsorted(other, f - khz / 1e3, side="left")
+        return np.searchsorted(other, f + khz / 1e3, side="right") - lo
+
+    df["multi_target"] = (within(tol_khz) > 0) | (within(band_khz) >= band_hits)
     df["interest"] = np.where(df["multi_target"], (df["interest"] * 0.2).round(1), df["interest"])
     return df.sort_values("interest", ascending=False).reset_index(drop=True)
 

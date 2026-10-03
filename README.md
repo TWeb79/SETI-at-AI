@@ -26,7 +26,8 @@ Requires Python 3.11–3.13.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[radio,dev]"          # add ,dashboard for Streamlit; ,gpu for CuPy (experimental)
+# add ,dashboard for Streamlit; ,gpu for CuPy (experimental)
+pip install -e ".[radio,dev]"
 ```
 blimpy/turboSETI are no longer required (optional `[compare]` extra for cross-checks).
 
@@ -39,10 +40,13 @@ blimpy/turboSETI are no longer required (optional `[compare]` extra for cross-ch
 ## Development and quality gates
 
 ```bash
-pytest                                   # 72 tests
+# run the tests
+pytest
 pytest --cov=ai_seti --cov-report=term-missing
-ruff check .                             # lint
-mypy                                     # typecheck (configured in pyproject.toml)
+# lint
+ruff check .
+# typecheck (configured in pyproject.toml)
+mypy
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint, typecheck and tests on Python 3.11, 3.12 and
@@ -71,26 +75,42 @@ is downloaded and nothing leaves the machine.
 Pick whichever fits:
 
 ```bash
-ai-seti analyze data/raw/obs.fil                        # a file already on disk
-ai-seti analyze https://example.org/obs.0000.fil        # a URL, streamed not downloaded
-ai-seti crunch --target HIP --max-units 8               # fetch new BL observations, keep going
+# a file already on disk
+ai-seti analyze data/raw/obs.fil
+# a URL, streamed not downloaded
+ai-seti analyze https://example.org/obs.0000.fil
+# fetch new BL observations, keep going
+ai-seti crunch --target HIP --max-units 8
 ```
 
 `analyze` searches one file, once. `crunch` is the SETI@home-style loop: it asks the
 Breakthrough Listen archive for work, processes everything it has not seen, and remembers
 what it already did in `data/state.json`. `--max-units N` caps each observation at N units
 per run; the next run continues at the next channel, and an observation only counts as done
-once every channel has been searched.
+once every channel has been searched. Half of each run's `--limit` slots go to files not
+started yet, so new targets keep arriving while big files are worked through.
+
+`crunch` skips files it cannot usefully search, and records why in `data/state.json`:
+mid-resolution products (`.0002`), whose channels are too wide to measure drift (use the
+`.0000` file of the same scan, or `--include-unresolvable`), and high-time-resolution products
+(`.8.0001`), which are pulsar data and would need ~26 GB per work unit. `--retry-failed`
+forgets recorded failures after an update.
+
+After each observation `crunch` prints, besides the top-candidates table, a plain summary:
+how far through the file this run got, how many signals rose above the noise, why each one was
+set aside (receiver artefact, seen at another star, doesn't drift, interference-shaped, …;
+each signal counted once, under its strongest reason), and a one-line verdict.
 
 Before hunting for aliens, it is worth checking the file you have is sane:
 
 ```bash
-ai-seti inspect data/raw/obs.fil    # header only: size, sample rate, channel width, source
+# header only: size, sample rate, channel width, source
+ai-seti inspect data/raw/obs.fil
 ```
 
 ### 3. Read the report
 
-Each run writes a folder — `reports/analysis` or `reports/crunch` by default:
+Each run writes a folder — `reports/demo`, `reports/analysis` or `reports/crunch` by default:
 
 | File | What it is |
 |---|---|
@@ -103,11 +123,168 @@ Each run writes a folder — `reports/analysis` or `reports/crunch` by default:
 The single number that ranks candidates is **interest**, 0–100. It blends how ET-like the
 signal looks, its SNR, and how unusual it is against every other hit in the same run.
 
-## The AI part: running with or without it
+## What the search looks for
 
-The AI is one optional layer on top of the search. A classifier looks at each hit and
-labels it — `technosignature_like`, `rfi_zero_drift`, `rfi_intermittent`, and so on — and
-feeds a 0–1 "this looks like a technosignature" probability into the interest score.
+### The idea in one paragraph
+
+A radio telescope records power at millions of narrow frequency channels, over and over in
+time. The result is a *waterfall*: frequency across, time down. Almost everything in it is
+noise, the receiver itself, or human transmitters (satellites, radar, phones, aircraft).
+AI-SETI looks for the one kind of signal nature is not known to make: a **tone only a few Hz
+wide that slides slowly in frequency**, because the transmitter sits on a moving, rotating
+world. Everything else in the pipeline exists to throw out the many things that look a bit
+like that.
+
+### What a technosignature would have to look like
+
+A signal only stays on the list if it passes every test below. Each test rules out a common
+impostor.
+
+| Property | Why it matters | How AI-SETI checks it | Impostor it rules out |
+|---|---|---|---|
+| **Narrowband** (one or a few channels, ~3 Hz each) | No known natural process makes Hz-wide tones; the narrowest natural lines (masers) are hundreds of Hz wide. | `bandwidth_ch`, wide hits (> 8 channels) lose 60% of their score | broadband interference, natural emission |
+| **Drifts** (non-zero `drift_rate_hz_s`) | A transmitter on another planet accelerates relative to us, and its frequency slides. A transmitter on Earth moves *with* the telescope and stays put. | Taylor-tree de-Doppler search over ±4 Hz/s; `zero_drift` costs 70% of the score and blocks sharing | ground transmitters, the receiver's own tones |
+| **Steady** (present all through the scan) | A beacon should be there in every sample, not flicker. | `on_fraction`, `modulation`, `wobble_rms` | intermittent and frequency-hopping interference |
+| **Only at the target** | A signal from a star is only seen when the telescope points at that star. | Same frequency, or a busy band, already seen at *another* star → `multi_target`; the ON/OFF `cadence` filter | anything picked up through the side of the beam |
+| **Not an instrument artefact** | GBT coarse channels make mirror copies of strong tones around each channel centre. | `mirror_pair`, `mirror_image` (score cut to a fifth) | the receiver's own spectral images |
+| **Outside known interference bands** | GPS, Galileo, Iridium, Inmarsat and others own fixed bands. | `known_rfi_band` (score halved) | satellites |
+| **Plausible strength** | The AI was trained on SNRs up to ~40. Far stronger tones are almost always nearby transmitters. | `out_of_distribution`: score cut by 70% and capped at 50 | strong terrestrial carriers |
+
+**What the drift tells you.** Drift is acceleration along the line of sight:
+`a = c × drift / frequency`. Earth's own rotation gives about 0.03 m/s², which is about
+**0.9 Hz/s at 8 GHz**. The default ±4 Hz/s limit covers accelerations up to ~0.15 m/s² at
+8 GHz (more at lower frequencies), which is the range expected for transmitters on planets.
+
+### Normal vs unusual: two examples
+
+These figures are the raw waterfall around a hit (`docs/make_figures.py` regenerates them).
+Frequency runs from high to low, left to right, as in the data files.
+
+**Normal: interference.** A real carrier from Breakthrough Listen data (HIP2579, 7990.78 MHz).
+A vertical line: it doesn't drift, so it is on Earth. It is ~280× the noise and turned up
+again while pointing at another star.
+
+![A stationary terrestrial carrier in real data](docs/images/signal_normal.png)
+
+**Unusual: what the search is built to find.** A one-channel tone that drifts steadily.
+**This one is simulated** (the `ai-seti demo` injection). No real one has ever been
+confirmed, by AI-SETI or anyone else.
+
+![A simulated narrowband drifting tone](docs/images/signal_unusual.png)
+
+The terminal says the same thing in words after every observation. A real search, where
+everything had an ordinary explanation (`ai-seti crunch --target HIP --max-units 8`, HIP2586):
+
+```
+Seen: 135 signal(s) above the noise. Set aside:
+     49  seen (or in a band busy with signals) at another star, so not from this one
+     22  do not drift, so almost certainly transmitted from Earth
+     64  shaped like interference, according to the AI
+Verdict: nothing here needs follow-up; everything has an ordinary explanation.
+```
+
+A synthetic file with a hidden ET-like tone (`ai-seti crunch --source synthetic`):
+
+```
+Seen: 45 signal(s) above the noise. Set aside:
+     27  do not drift, so almost certainly transmitted from Earth
+     17  shaped like interference, according to the AI
+Verdict: 1 signal(s) passed every automatic check. Best: 1419.887255 MHz, drifting
++1.582 Hz/s, interest 87/100. Still unverified until an ON/OFF cadence check and a
+re-observation.
+```
+
+### Step by step, for one observation
+
+1. **Split.** The file is cut into *work units* of 262,144 channels (~0.73 MHz on high-res
+   data), each padded by the channels a drifting tone can reach.
+2. **Clean.** The bright spike at each coarse-channel centre is repaired, the receiver's
+   bandpass ripple is divided out, and every block of channels is scaled to unit noise.
+3. **Search.** A Taylor-tree de-Doppler search adds up power along every straight line in the
+   waterfall, from zero drift to the limit, both directions. Lines that rise above **SNR 10**
+   become hits. A one-sample spike search and a dispersed-pulse search also run; they only
+   write `spikes.csv` and `pulses.csv` (backlog B37).
+4. **Describe.** Each hit gets physical features (width, steadiness, wobble, side-lobes, …)
+   and a small de-drifted image of itself.
+5. **Judge.** The AI classifies each hit (see [the AI part](#the-ai-part-and-how-it-works-with-the-search)),
+   the anomaly detector rates how unusual it is in this run, and the flags above are set.
+6. **Score.** `interest` (0–100) combines all of it. The terminal summary, `report.html` and
+   `candidates.csv` are written, and the ledger is updated.
+
+The technical one-screen version is [How a work unit is processed](#how-a-work-unit-is-processed).
+
+**What a high score is not.** Interest is a ranking, not a probability of ET. The strongest
+remaining test, pointing away and back (the ON/OFF cadence), still has to be run by hand with
+`ai-seti cadence` on archive data (backlog B7), and the classifier has only seen slower drifts
+than the search covers (backlog B3).
+
+## Where unusual signals end up, and how to report them
+
+Every observation gets its own folder under `reports/` (`reports/crunch/<file>` or
+`…/<file>_ch<start>-<stop>` for a partial run, `reports/analysis`, `reports/demo`):
+
+| File | What is in it | Use it to |
+|---|---|---|
+| `report.html` | The top candidates, with a plain-language "why it scores this" for each and a 3D view of the best one | look first |
+| `candidates.csv` | **Every** hit, one row each: `frequency_mhz`, `drift_rate_hz_s`, `snr`, `interest`, `ai_class` and `p_*` probabilities, `anomaly`, and the flags `zero_drift`, `drift_unresolved`, `known_rfi_band`, `mirror_pair`, `mirror_image`, `multi_target` | sort, filter, check |
+| `metadata.json` | Config, software versions, file header, the drift range actually searched, timings, AI warnings | reproduce the run |
+| `band_overview.png` | The whole searched band at a glance | spot crowded regions |
+| `spikes.csv`, `pulses.csv` | By-products of the secondary detectors (see B37) | rarely needed |
+
+An **unusual signal** is a row with `ai_class = technosignature_like`, a high `interest`, and
+none of the flags set. The terminal verdict counts exactly these ("N signal(s) passed every
+automatic check") and names the best one, so you don't have to open the CSV to know whether
+there is anything to look at.
+
+`data/state.json` (the ledger) remembers across runs which files are done or half done, which
+failed, the lifetime best signal, and the frequencies seen at each star. That list is what
+makes the "seen at another star" flag work.
+
+**Reporting back.** `ai-seti share <report folder>` turns the top candidates into
+`ai-seti-finding/1` records. Each one has a stable ID (same file, frequency and drift → same
+ID), a checklist, a de-drifted image and a SHA-256. It first runs the same gate as above:
+zero-drift, RFI-band, mirror-image and seen-elsewhere signals never leave the machine. Then:
+
+* without options, a local bundle: `reports/share/<finding_id>.zip` with
+  `finding.json`, `finding.md` and `finding.png`, ready to attach to an email;
+* `--to github --repo owner/name --yes` opens one issue per finding (duplicates are linked,
+  not re-filed); `--to webhook` posts to Slack, Discord or any JSON endpoint;
+* remote destinations only accept findings that **passed an ON/OFF cadence** unless you say
+  `--no-require-cadence`, and the ledger never sends the same finding to the same place twice.
+
+Details and every option: [Sharing findings back](#sharing-findings-back).
+
+## The AI part, and how it works with the search
+
+**Two different jobs.** The non-AI part *finds* signals and measures them. The AI part
+*judges* what was found. The AI never searches the waterfall itself: it sees only the
+features and a small image of hits the search already made. It can't add a hit or remove
+one; it only changes labels and the order of the list.
+
+| Question | Answered by | How |
+|---|---|---|
+| Is there a narrow line in the data, and how does it drift? | **search** (deterministic) | bandpass removal, Taylor-tree de-Doppler, SNR threshold |
+| How wide, steady and wobbly is it? | **search** | measured features of each hit |
+| Is it in a satellite band, a mirror image, seen at another star, unmeasurable in drift? | **search** (rules) | the flags in `candidates.csv` |
+| Does it *look like* an ET-like tone or a known kind of interference? | **AI: classifier** | gradient-boosted trees on the features + a 16×16 de-drifted image, trained on simulated hits that went through this exact pipeline; 6 classes (`technosignature_like`, 4 interference shapes, `noise`) |
+| Is it unlike everything else in this observation? | **AI: anomaly detector** | an isolation forest fitted fresh on each run's hits; 0–1 |
+| How interesting is it overall? | **both** | `interest = 100 × (0.55 × p(ET-like) + 0.20 × f(SNR) + 0.25 × anomaly)`, then the rule penalties (zero drift ×0.3, RFI band ×0.5, wider than 8 channels ×0.4, mirror ×0.2, seen elsewhere ×0.2) and, for `out_of_distribution`, ×0.3 and a cap of 50 |
+
+**Why both.** The rules are certain where physics is certain: a tone that doesn't drift is on
+Earth, whatever it looks like. The classifier catches what rules miss, such as interference
+that drifts but wobbles, flickers or chirps. The anomaly score is there for signals nobody
+thought to simulate. Each check covers the other's blind spots.
+
+**When the AI should not be trusted, it says so.**
+* `out_of_distribution`: the hit is more than 3× stronger than anything in the training
+  set. The classifier's probability is not used for it; its interest is cut by 70% and
+  capped at 50, so a strong carrier never heads the list.
+* `model_unavailable`: the model file didn't load. The score falls back to a fixed rule,
+  and `report.html` shows a warning banner.
+* `ai_disabled`: you switched it off (below).
+* `drift_unresolved`: the file's channels are too wide to see drift at all (mid-resolution
+  products, which `crunch` skips unless asked). No "doesn't drift" verdict is drawn from such
+  data.
 
 ### With AI (the default)
 
@@ -151,16 +328,25 @@ should not look like a clean one. The usual cause is a scikit-learn version outs
 ## Quick start
 
 ```bash
-ai-seti demo                       # synthetic GBT coarse channel, 3 hidden ET-like tones + 60 RFI
-ai-seti status                     # is SETI@home sending work? is the BL archive reachable?
-ai-seti crunch --target HIP --max-units 8          # auto-load real BL data, live dashboard
-ai-seti crunch --forever --poll-seconds 900         # BOINC-style: keep crunching new data
-ai-seti crunch --source local --watch-dir data/raw  # your own files
+# synthetic GBT coarse channel, 3 hidden ET-like tones + 60 RFI
+ai-seti demo
+# is SETI@home sending work? is the BL archive reachable?
+ai-seti status
+# auto-load real BL data, live dashboard
+ai-seti crunch --target HIP --max-units 8
+# BOINC-style: keep crunching new data
+ai-seti crunch --forever --poll-seconds 900
+# your own files
+ai-seti crunch --source local --watch-dir data/raw
 ai-seti analyze data/raw/obs.fil --f-start-mhz 1420 --f-stop-mhz 1421
-ai-seti analyze http://…/obs.0000.fil               # remote, streamed
+# remote, streamed
+ai-seti analyze http://…/obs.0000.fil
 ai-seti cadence A.fil B_OFF.fil A2.fil C_OFF.fil A3.fil D_OFF.fil
-ai-seti benchmark                  # v0.1 vs v0.2 injection/recovery
-ai-seti train                      # retrain the hit classifier (~10 s, CPU)
+# v0.1 vs v0.2 injection/recovery
+ai-seti benchmark
+# retrain the hit classifier (~1 min, CPU)
+ai-seti train
+# web UI at http://127.0.0.1:8061 (port and localhost-only bind: .streamlit/config.toml)
 streamlit run app.py
 ```
 
@@ -178,12 +364,14 @@ results. AI-SETI packages each finding as a self-describing `ai-seti-finding/1` 
 checklist, SHA-256) and sends it where you choose:
 
 ```bash
-ai-seti share reports/crunch/<obs>                       # preview + local bundle (zip, PNG, Markdown)
+# preview + local bundle (zip, PNG, Markdown)
+ai-seti share reports/crunch/<obs>
 ai-seti share reports/crunch/<obs> --to github --repo your-org/ai-seti-findings --yes
 ai-seti share reports/crunch/<obs> --to webhook --webhook https://discord.com/api/webhooks/… \
         --webhook-format discord --handle "your-name" --yes
 ai-seti share reports/cadence/A --cadence-events reports/cadence/events.csv --require-cadence --yes
-ai-seti crunch --auto-share        # share after every observation, using share_* in the config
+# share after every observation, using share_* in the config
+ai-seti crunch --auto-share
 ```
 
 - **GitHub:** one issue per finding, labelled `candidate`/`unverified`; token from

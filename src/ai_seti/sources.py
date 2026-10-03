@@ -73,6 +73,22 @@ def drift_resolvable(header: FilterbankHeader, cfg: SearchConfig) -> bool:
     return not foff_hz or cfg.max_drift_rate_hz_s * header.nsamples * header.tsamp >= foff_hz
 
 
+def unit_too_large(header: FilterbankHeader, cfg: SearchConfig) -> str | None:
+    """Why one work unit of this file would not fit in memory, or None if it does.
+
+    BL's high-time-resolution .8.0001 products are 8,192 channels x ~840,000 samples: a single
+    unit would be ~27 GB of float32 fetched with one Range request per sample row. They are
+    pulsar/transient data, not drift-search data, so refuse them up front.
+    """
+    width = min(int(cfg.channels_per_unit), header.nchans) + 2 * drift_padding(header, cfg)
+    mb = min(width, header.nchans) * header.nsamples * 4 / 2**20
+    if mb > cfg.max_download_mb:
+        return (f"one work unit would be {mb:,.0f} MB ({header.nsamples:,} time samples); "
+                f"limit is max_download_mb = {cfg.max_download_mb:,}. High-time-resolution "
+                "products are not searched for drifting tones.")
+    return None
+
+
 def split(location: str, header: FilterbankHeader, cfg: SearchConfig, kind: str = "local",
           chan_range: tuple[int, int] | None = None, meta: dict | None = None) -> list[WorkUnit]:
     """Cut an observation into overlapping channel windows (the SETI@home 'splitter')."""
@@ -107,7 +123,7 @@ class LocalSource:
     def __init__(self, directory: Path):
         self.directory = Path(directory)
 
-    def observations(self, done: set[str]):
+    def observations(self, done: set[str], partial: frozenset[str] | set[str] = frozenset()):
         for p in sorted(self.directory.glob("**/*")):
             if p.suffix.lower() in (".fil", ".h5", ".hdf5") and str(p) not in done:
                 hdr = read_header(p)
@@ -120,7 +136,7 @@ class SyntheticSource:
         self.out_dir, self.n, self.n_chan, self.seed = Path(out_dir), n, n_chan, seed
         self.injections: dict[str, list] = {}
 
-    def observations(self, done: set[str]):
+    def observations(self, done: set[str], partial: frozenset[str] | set[str] = frozenset()):
         from .ai.simulate import synthetic_observation
         self.out_dir.mkdir(parents=True, exist_ok=True)
         for i in range(self.n):
@@ -161,19 +177,28 @@ class BreakthroughListenSource:
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
-    def new_rows(self, done: set[str]) -> list[dict]:
-        """Up to `limit` rows not in `done`, widening the query past rows already seen."""
+    def new_rows(self, done: set[str], partial: frozenset[str] | set[str] = frozenset()) -> list[dict]:
+        """Up to `limit` rows not in `done`, widening the query past rows already seen.
+
+        Half the slots go to files not started yet: one high-res file needs hundreds of
+        `--max-units` runs, and resumed files would otherwise take every slot (backlog B29).
+        """
         want = int(self.params.get("limit") or 20)
+        half = (want + 1) // 2
         n = want
         while True:
             rows = self.query(n)
             new = [r for r in rows if r["url"] not in done]
-            if len(new) >= want or len(rows) < n or n >= MAX_QUERY_ROWS:
-                return new[:want]
+            fresh = [r for r in new if r["url"] not in partial]
+            if (len(new) >= want and len(fresh) >= half) or len(rows) < n or n >= MAX_QUERY_ROWS:
+                resumed = [r for r in new if r["url"] in partial]
+                picked = fresh[:half]
+                picked += resumed[:want - len(picked)]
+                return picked + fresh[half:half + want - len(picked)]
             n = min(n * 4, MAX_QUERY_ROWS)
 
-    def observations(self, done: set[str]):
-        for row in self.new_rows(done):
+    def observations(self, done: set[str], partial: frozenset[str] | set[str] = frozenset()):
+        for row in self.new_rows(done, partial):
             url = row["url"]
             meta = {"target": row.get("target"), "telescope": row.get("telescope"),
                     "ra": row.get("ra"), "decl": row.get("decl"), "mjd": row.get("mjd"),

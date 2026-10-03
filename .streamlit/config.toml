@@ -1,0 +1,9 @@
+# Project 61 → web dashboard 8061 (RULES_ports.md). Localhost only: the app can read local
+# paths, so it must not be reachable from the network unless you change this deliberately.
+[server]
+port = 8061
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false
