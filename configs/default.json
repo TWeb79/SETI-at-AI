@@ -15,7 +15,6 @@
   ],
   "share_min_interest": 70.0,
   "share_top": 3,
-  "share_require_cadence": false,
   "github_repo": null,
   "webhook_url": null,
   "webhook_format": "json",

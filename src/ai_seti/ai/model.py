@@ -27,6 +27,18 @@ DEFAULT_MODEL = Path(__file__).with_name("hit_classifier.joblib")
 
 logger = logging.getLogger(__name__)
 
+# Highest hit SNR in the bundled model's training set (`ai-seti train` defaults: seed 0,
+# 500 per class; reproduced 2026-10-03). Used for models whose metadata predates the
+# recorded "snr_max". Above OOD_SNR_FACTOR x this, the trees only extrapolate flat, so
+# p(technosignature_like) means nothing there (backlog B8).
+TRAINED_SNR_MAX = 40.24
+OOD_SNR_FACTOR = 3.0
+
+
+def ood_snr_limit(meta: dict) -> float:
+    """SNR above which a hit is outside what the classifier was trained on."""
+    return OOD_SNR_FACTOR * float(meta.get("snr_max", TRAINED_SNR_MAX))
+
 
 def _sklearn_version() -> str:
     """Installed scikit-learn version, or a placeholder if sklearn is unavailable."""
@@ -96,6 +108,7 @@ def train(n_per_class: int = 400, seed: int = 0, out: Path = DEFAULT_MODEL, prog
     cm = confusion_matrix(yte, clf.predict(xte), labels=range(len(LABELS))).tolist()
     meta = {"labels": LABELS, "scalar_features": SCALAR_FEATURES, "test_accuracy": acc,
             "confusion_matrix": cm, "n_train": len(ytr), "train_seconds": time.time() - t0,
+            "snr_max": float(x[:, SCALAR_FEATURES.index("snr")].max()),
             # Recorded so a load-time mismatch can be reported precisely instead of guessed.
             "sklearn_version": sklearn.__version__, "numpy_version": np.__version__}
     joblib.dump({"model": clf, "meta": meta}, out)

@@ -40,7 +40,7 @@ class SearchConfig:
     share_to: list[str] = field(default_factory=lambda: ["bundle"])  # bundle | github | webhook
     share_min_interest: float = 70.0
     share_top: int = 3
-    share_require_cadence: bool = False
+    share_require_cadence: bool | None = None   # None: required for github/webhook only
     github_repo: str | None = None          # e.g. "your-org/ai-seti-findings"
     webhook_url: str | None = None
     webhook_format: str = "json"            # json | slack | discord

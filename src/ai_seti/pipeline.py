@@ -41,6 +41,7 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
     from .dsp.dedoppler import drift_search
     from .dsp.detectors import find_pulses, find_spikes
     from .dsp.preprocess import normalize
+    from .sources import drift_resolvable
 
     timings = {}
     t = time.perf_counter()
@@ -48,6 +49,7 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
     timings["load"] = time.perf_counter() - t
 
     hdr = wu.header
+    unresolved = not drift_resolvable(hdr, cfg)
     freqs = hdr.frequencies(wu.chan_start, wu.chan_stop)
     t = time.perf_counter()
     nfine = cfg.fine_channels_per_coarse or hdr.fine_per_coarse()
@@ -81,6 +83,10 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
         feats, img = hit_features(z, h.start_channel, h.drift_ch_per_step, h.snr)
         row = {"unit_id": wu.unit_id, "channel": abs_start, **h.to_dict(), **feats}
         row.pop("start_channel")
+        # Start channel of this tone's spectral image about the coarse-channel DC bin (B6).
+        dc = (abs_start // nfine) * nfine + nfine // 2 if nfine else None
+        row["mirror_channel"] = 2 * dc - abs_start if dc is not None else -1
+        row["drift_unresolved"] = unresolved
         rows.append(row)
         vectors.append(feature_vector(feats, img))
         row["_snippet"] = img.round(3).tolist()
@@ -108,6 +114,11 @@ def process_work_unit(wu: WorkUnit, cfg: SearchConfig) -> dict:
     }
 
 
+def _failed_result(wu: WorkUnit, exc: BaseException) -> dict:
+    return {"unit_id": wu.unit_id, "error": repr(exc), "hits": [], "spikes": [],
+            "pulses": [], "timings": {}, "n_channels": 0, "meta": wu.meta}
+
+
 def _worker_init():
     _limit_threads()
 
@@ -120,7 +131,10 @@ def run_units(units: list[WorkUnit], cfg: SearchConfig, on_result=None,
     if n == 1:
         _limit_threads()
         for wu in units:
-            res = process_work_unit(wu, cfg)
+            try:
+                res = process_work_unit(wu, cfg)
+            except Exception as exc:    # same contract as the pool path below
+                res = _failed_result(wu, exc)
             if on_result:
                 on_result(res)
             yield res
@@ -131,9 +145,7 @@ def run_units(units: list[WorkUnit], cfg: SearchConfig, on_result=None,
             try:
                 res = fut.result()
             except Exception as exc:
-                wu = futures[fut]
-                res = {"unit_id": wu.unit_id, "error": repr(exc), "hits": [], "spikes": [],
-                       "pulses": [], "timings": {}, "n_channels": 0, "meta": wu.meta}
+                res = _failed_result(futures[fut], exc)
             if on_result:
                 on_result(res)
             yield res
@@ -143,7 +155,7 @@ def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
     """Merge hits from all units, add anomaly + RFI flags, compute interest score."""
     from .ai.features import SCALAR_FEATURES
     from .ai.model import anomaly_scores
-    from .rfi import in_known_rfi_band
+    from .rfi import flag_mirror_images, in_known_rfi_band
 
     rows = [h for r in results for h in r.get("hits", [])]
     if not rows:
@@ -151,24 +163,36 @@ def score_candidates(results: list[dict], cfg: SearchConfig) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df["anomaly"] = anomaly_scores(df[SCALAR_FEATURES].to_numpy(), cfg.anomaly_contamination)
     df["known_rfi_band"] = in_known_rfi_band(df["frequency_mhz"], cfg.known_rfi_bands_mhz)
+    df = flag_mirror_images(df)
 
     thr = cfg.snr_threshold
     s_snr = np.clip(1 - np.exp(-(df["snr"] - thr) / thr), 0, 1)
+    heuristic = ((df["zero_drift"] == 0) & (df["bandwidth_ch"] <= 4)
+                 & (df["on_fraction"] >= 0.5)).astype(float) * 0.7
+    from .ai.model import HitScorer, ood_snr_limit
+    # Far above the training SNRs the classifier saturates (B8): don't trust p there. The
+    # interest cap below applies in every mode, the heuristic is no better at these SNRs.
+    ood = df["snr"] > ood_snr_limit(HitScorer(cfg.model_path).meta if cfg.use_ai else {})
     if "p_technosignature_like" in df and df["p_technosignature_like"].notna().any():
-        p_et = df["p_technosignature_like"].fillna(0.0)
+        p_et = df["p_technosignature_like"].fillna(0.0).where(~ood, heuristic)
     else:   # heuristic fallback when no model is available
-        p_et = ((df["zero_drift"] == 0) & (df["bandwidth_ch"] <= 4)
-                & (df["on_fraction"] >= 0.5)).astype(float) * 0.7
+        p_et = heuristic
     anomaly = df["anomaly"].fillna(0.5)
     score = 0.55 * p_et + 0.20 * s_snr + 0.25 * anomaly
-    score *= np.where(df["zero_drift"] > 0, 0.3, 1.0)
+    # "Doesn't drift" is evidence of an Earth source only where drift could have been seen (B19).
+    unresolved = df.get("drift_unresolved", pd.Series(False, index=df.index)).fillna(False)
+    score *= np.where((df["zero_drift"] > 0) & ~unresolved.astype(bool), 0.3, 1.0)
     score *= np.where(df["known_rfi_band"], 0.5, 1.0)
     score *= np.where(df["bandwidth_ch"] > 8, 0.4, 1.0)
+    score *= np.where(df["mirror_image"], 0.2, 1.0)
     df["interest"] = (100 * score).round(1)
+    # Strong out-of-range carriers are usually terrestrial; cap them until a cadence clears them.
+    df["interest"] = df["interest"].where(~ood, df["interest"].clip(upper=50.0))
 
     prob_cols = [c for c in df.columns if c.startswith("p_")]
     if prob_cols and df[prob_cols].notna().any().any():
         df["ai_class"] = df[prob_cols].idxmax(axis=1).str[2:]
+        df.loc[ood, "ai_class"] = "out_of_distribution"
     elif not cfg.use_ai:
         df["ai_class"] = "ai_disabled"
     else:

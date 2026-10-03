@@ -150,6 +150,20 @@ def test_score_candidates_reports_disabled_ai():
     assert (cands["ai_class"] == "ai_disabled").all()
 
 
+def test_far_out_of_range_snr_is_not_trusted_as_technosignature():
+    """B8: the classifier saturates at p=1 for any strong drifting carrier."""
+    rows = pd.concat([_hit_frame("x")] * 2, ignore_index=True)
+    rows["snr"] = [20.0, 10_000.0]
+    rows["channel"] = [5, 900]
+    for label in LABELS:
+        rows[f"p_{label}"] = 1.0 if label == "technosignature_like" else 0.0
+    cands = score_candidates([{"hits": rows.to_dict("records")}], SearchConfig())
+    strong = cands[cands["snr"] == 10_000.0].iloc[0]
+    normal = cands[cands["snr"] == 20.0].iloc[0]
+    assert strong["ai_class"] == "out_of_distribution" and strong["interest"] <= 50
+    assert normal["ai_class"] == "technosignature_like" and normal["interest"] > 50
+
+
 def test_write_outputs_records_ai_note(tmp_path):
     """The inactive-AI warning must survive into the run metadata and the HTML report."""
     cfg = SearchConfig(model_path=str(tmp_path / "absent.joblib"))
@@ -298,3 +312,43 @@ def test_split_units_are_padded_by_the_shared_rule(tmp_path):
     assert first.chan_start == 0 and first.chan_stop >= first.core_stop + pad - 8
     mid = units[1]
     assert mid.chan_start == mid.core_start - pad, "interior units must be padded on both sides"
+
+
+def test_partial_range_units_are_padded_beyond_the_range_edges():
+    """--max-units chunk edges are not data edges: a tone drifting across one needs its pad."""
+    hdr, cfg = _header(), SearchConfig(channels_per_unit=8192)
+    pad = drift_padding(hdr, cfg)
+    units = split("x.fil", hdr, cfg, chan_range=(16384, 32768))
+    assert units[0].chan_start == 16384 - pad and units[-1].chan_stop == 32768 + pad
+    assert (units[0].core_start, units[-1].core_stop) == (16384, 32768)
+
+
+def test_far_out_of_range_snr_is_capped_without_a_classifier():
+    """B8 review: the heuristic fallback trusted a SNR-10,000 carrier just as blindly."""
+    rows = _hit_frame("x")
+    rows["snr"] = 10_000.0
+    cands = score_candidates([{"hits": rows.to_dict("records")}], SearchConfig(use_ai=False))
+    assert cands.iloc[0]["interest"] <= 50
+
+
+def test_midres_hits_are_drift_unresolved_not_stationary():
+    """B19: on BL mid-res products drift cannot move a tone one channel; that isn't 'zero'."""
+    from ai_seti.share import checklist, passes_gate
+    from ai_seti.sources import drift_resolvable
+
+    midres = FilterbankHeader(fch1=8001.46, foff=-2.86102294921875e-03, nchans=1 << 20,
+                              tsamp=1.0737418239999998, nsamples=272)
+    assert not drift_resolvable(midres, SearchConfig())
+    assert drift_resolvable(_header(), SearchConfig())
+
+    rows = pd.concat([_hit_frame("x")] * 2, ignore_index=True)
+    rows["zero_drift"] = 1.0
+    rows["drift_unresolved"] = [True, False]
+    rows["channel"] = [5, 900]
+    cands = score_candidates([{"hits": rows.to_dict("records")}], SearchConfig(use_ai=False))
+    unresolved = cands[cands["drift_unresolved"]].iloc[0]
+    stationary = cands[~cands["drift_unresolved"]].iloc[0]
+    assert unresolved["interest"] > stationary["interest"], "no zero-drift penalty when unmeasurable"
+    rec = {"checklist": checklist(unresolved, "not_run", False), "assessment": {"cadence": "not_run"}}
+    ok, why = passes_gate(rec)
+    assert not ok and "not measurable" in why

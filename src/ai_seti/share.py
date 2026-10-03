@@ -76,11 +76,16 @@ def _cadence_status(row: pd.Series, events: pd.DataFrame | None) -> str:
 def checklist(row: pd.Series, cadence: str, bands_flag: bool) -> list[dict]:
     return [
         {"check": "Drifts (non-zero Doppler drift, as an off-Earth source would)",
-         "result": not bool(row.get("zero_drift", 0))},
+         "result": None if bool(row.get("drift_unresolved", False))
+         else not bool(row.get("zero_drift", 0))},
         {"check": "Narrowband (<= 4 channels)", "result": bool(row.get("bandwidth_ch", 99) <= 4)},
         {"check": "Present in >= 75% of time samples",
          "result": bool(row.get("on_fraction", 0) >= 0.75)},
         {"check": "Outside known satellite / RFI bands", "result": not bands_flag},
+        {"check": "Not a mirror image about the coarse-channel centre",
+         "result": not bool(row.get("mirror_image", False))},
+        {"check": "Not also seen in a different target",
+         "result": not bool(row.get("multi_target", False))},
         {"check": "Passed ON/OFF cadence filter (absent when pointing away)",
          "result": None if cadence == "not_run" else cadence == "passed"},
         {"check": "Cross-checked with an independent pipeline (e.g. turboSETI)", "result": None},
@@ -149,10 +154,16 @@ def build_findings(report_dir: Path, top: int = 3, min_interest: float = 0.0,
 
 def passes_gate(rec: dict, require_cadence: bool = False) -> tuple[bool, str]:
     checks = {c["check"].split(" (")[0]: c["result"] for c in rec["checklist"]}
+    if checks.get("Drifts") is None:
+        return False, "drift not measurable at this resolution (cannot rule out Earth)"
     if not checks.get("Drifts"):
         return False, "zero drift (almost always terrestrial)"
     if checks.get("Outside known satellite / RFI bands") is False:
         return False, "inside a known RFI band"
+    if checks.get("Not a mirror image about the coarse-channel centre") is False:
+        return False, "mirror image about the coarse-channel centre (instrument artefact)"
+    if checks.get("Not also seen in a different target") is False:
+        return False, "also seen in a different target (interference)"
     if require_cadence and rec["assessment"]["cadence"] != "passed":
         return False, f"cadence {rec['assessment']['cadence']}"
     return True, "ok"
@@ -303,12 +314,16 @@ def to_webhook(recs: list[dict], url: str, fmt: str = "json") -> list[ShareResul
 
 def share(recs: list[dict], destinations: list[str], *, bundle_dir: Path, ledger=None,
           repo: str | None = None, webhook: str | None = None, webhook_format: str = "json",
-          allow_synthetic: bool = False, require_cadence: bool = False,
+          allow_synthetic: bool = False, require_cadence: bool | None = None,
           github_api: str = "https://api.github.com") -> tuple[list[ShareResult], list[tuple]]:
-    """Gate, dedupe against the ledger, then send. Returns (results, skipped)."""
+    """Gate, dedupe against the ledger, then send. Returns (results, skipped).
+
+    `require_cadence=None` requires a cadence pass for remote destinations only: an
+    uncadenced candidate may go into the local bundle but is never published (B8).
+    """
     sendable, skipped = [], []
     for rec in recs:
-        ok, why = passes_gate(rec, require_cadence)
+        ok, why = passes_gate(rec, bool(require_cadence))
         if not ok:
             skipped.append((rec["finding_id"], why))
             continue
@@ -322,6 +337,10 @@ def share(recs: list[dict], destinations: list[str], *, bundle_dir: Path, ledger
         batch_ids = {r["finding_id"] for r in batch}
         skipped += [(r["finding_id"], f"already shared to {dest}")
                     for r in sendable if r["finding_id"] not in batch_ids]
+        if dest != "bundle" and require_cadence is None:
+            uncad = [r for r in batch if r["assessment"]["cadence"] != "passed"]
+            skipped += [(r["finding_id"], f"no cadence pass, not sent to {dest}") for r in uncad]
+            batch = [r for r in batch if r["assessment"]["cadence"] == "passed"]
         if dest != "bundle":
             synth = [r for r in batch if r["observation"].get("synthetic")]
             if synth and not allow_synthetic:

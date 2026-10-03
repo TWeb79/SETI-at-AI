@@ -127,7 +127,8 @@ def test_config_shipped_default_is_loadable():
         pytest.skip("configs/default.json not present in this checkout")
     cfg = SearchConfig.load(shipped)
     defaults = SearchConfig()
-    for key in ("channels_per_unit", "snr_threshold", "max_drift_rate_hz_s", "use_ai"):
+    for key in ("channels_per_unit", "snr_threshold", "max_drift_rate_hz_s", "use_ai",
+                "share_require_cadence"):   # B8: a pinned False would publish uncadenced finds
         assert getattr(cfg, key) == getattr(defaults, key), \
             f"configs/default.json sets {key} differently from the dataclass default"
 

@@ -22,6 +22,9 @@ from .io import remote
 from .io.filterbank import FilterbankHeader, read_header, write_sigproc
 
 BL_API = "http://seti.berkeley.edu/opendata/api"
+# The archive ignores offset/page/skip but returns a stable order, so "paging" means asking
+# for a longer list until it contains enough rows we have not seen (backlog B11).
+MAX_QUERY_ROWS = 2000
 SAH_STATUS = "https://setiathome.berkeley.edu/server_status.php?xml=1"
 
 
@@ -60,6 +63,16 @@ def drift_ceil_ch_per_step(header: FilterbankHeader, cfg: SearchConfig) -> int:
     return max(1, min(k, max(1, cfg.max_drift_ch_per_step)))
 
 
+def drift_resolvable(header: FilterbankHeader, cfg: SearchConfig) -> bool:
+    """True if the configured drift rate moves a tone at least one channel over the scan.
+
+    On BL mid-res products (2.86 kHz x 1.07 s x 272) the 4 Hz/s limit moves a tone ~1,170 Hz
+    over the whole observation, under one channel: drift there is unmeasurable, not zero (B19).
+    """
+    foff_hz = abs(header.foff) * 1e6
+    return not foff_hz or cfg.max_drift_rate_hz_s * header.nsamples * header.tsamp >= foff_hz
+
+
 def split(location: str, header: FilterbankHeader, cfg: SearchConfig, kind: str = "local",
           chan_range: tuple[int, int] | None = None, meta: dict | None = None) -> list[WorkUnit]:
     """Cut an observation into overlapping channel windows (the SETI@home 'splitter')."""
@@ -72,7 +85,9 @@ def split(location: str, header: FilterbankHeader, cfg: SearchConfig, kind: str 
         core1 = min(core0 + width, c1)
         units.append(WorkUnit(
             unit_id=f"{stem}:{core0}-{core1}", kind=kind, location=str(location), header=header,
-            chan_start=max(c0, core0 - pad), chan_stop=min(c1, core1 + pad),
+            # Pad into neighbouring channels even outside chan_range: a --max-units chunk
+            # edge is not a data edge, and a tone drifting across it needs its guard band.
+            chan_start=max(0, core0 - pad), chan_stop=min(header.nchans, core1 + pad),
             core_start=core0, core_stop=core1, meta=dict(meta or {}),
         ))
     return units
@@ -136,19 +151,29 @@ class BreakthroughListenSource:
         self.cache_dir = Path(cache_dir)
         self.max_download_mb = max_download_mb
 
-    def query(self) -> list[dict]:
+    def query(self, limit: int | None = None) -> list[dict]:
+        params = {**self.params, **({"limit": str(limit)} if limit else {})}
         url = f"{BL_API}/query-files?" + urllib.parse.urlencode(
-            {k: v for k, v in self.params.items() if v not in (None, "")})
+            {k: v for k, v in params.items() if v not in (None, "")})
         body, _, _ = remote._get(url)
         payload = json.loads(body)
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
+    def new_rows(self, done: set[str]) -> list[dict]:
+        """Up to `limit` rows not in `done`, widening the query past rows already seen."""
+        want = int(self.params.get("limit") or 20)
+        n = want
+        while True:
+            rows = self.query(n)
+            new = [r for r in rows if r["url"] not in done]
+            if len(new) >= want or len(rows) < n or n >= MAX_QUERY_ROWS:
+                return new[:want]
+            n = min(n * 4, MAX_QUERY_ROWS)
+
     def observations(self, done: set[str]):
-        for row in self.query():
+        for row in self.new_rows(done):
             url = row["url"]
-            if url in done:
-                continue
             meta = {"target": row.get("target"), "telescope": row.get("telescope"),
                     "ra": row.get("ra"), "decl": row.get("decl"), "mjd": row.get("mjd"),
                     "center_freq": row.get("center_freq"), "md5sum": row.get("md5sum"),

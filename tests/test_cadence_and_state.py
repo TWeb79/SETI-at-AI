@@ -184,11 +184,11 @@ def test_share_ledger_records_one_entry_per_destination(server):
     url, tmp_path, received = server
     rec = _rec("AIS-DDD")
     ledger = Ledger(path=tmp_path / "state.json")
-    share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger,
+    share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger, require_cadence=False,
           webhook=url, webhook_format="discord")
     assert received, "the finding should have reached the webhook"
     assert ledger.shared["AIS-DDD"] == ["webhook"]
-    _, skipped = share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger,
+    _, skipped = share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger, require_cadence=False,
                        webhook=url, webhook_format="json")
     assert any("already shared" in why for _, why in skipped)
     assert len(received) == 1, "the second send must not have reached the webhook"
@@ -198,7 +198,7 @@ def test_failed_send_is_not_recorded_in_the_ledger(tmp_path):
     """A webhook that errors must stay eligible for a later retry."""
     rec = _rec("AIS-EEE")
     ledger = Ledger(path=tmp_path / "state.json")
-    res, _ = share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger,
+    res, _ = share([rec], ["webhook"], bundle_dir=tmp_path / "out", ledger=ledger, require_cadence=False,
                    webhook="http://127.0.0.1:1/hook")   # nothing listening
     assert res and not res[0].ok
     assert "AIS-EEE" not in ledger.shared
@@ -244,3 +244,175 @@ def test_ledger_save_is_atomic(tmp_path):
     led.save()
     assert json.loads(path.read_text())["work_units"] == 11
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"], "temp file was left behind"
+
+
+def test_max_units_resumes_and_marks_done_only_when_whole_file_is_searched(tmp_path):
+    """B5: --max-units used to search the top of the band, then mark the whole file done."""
+    import json as _json
+
+    import numpy as _np
+    from typer.testing import CliRunner
+
+    from ai_seti.cli import app
+    from ai_seti.io.filterbank import FilterbankHeader, write_sigproc
+
+    unit = 8192
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    data = _np.random.default_rng(0).normal(1.0, 0.01, (16, 6 * unit)).astype(_np.float32)
+    write_sigproc(raw / "obs.fil", data, FilterbankHeader(
+        fch1=1420.0, foff=-2.7939677238464355e-06, nchans=6 * unit, tsamp=18.25, nsamples=16))
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"channels_per_unit": unit, "use_ai": False}))
+    state = tmp_path / "state.json"
+    args = ["crunch", "--source", "local", "--watch-dir", str(raw), "--max-units", "2",
+            "--state", str(state), "--outdir", str(tmp_path / "out"), "--no-live",
+            "--workers", "1", "--config", str(cfg)]
+    key = str(raw / "obs.fil")
+    for stop in (2 * unit, 4 * unit):
+        res = CliRunner().invoke(app, args)
+        assert res.exit_code == 0, res.output
+        led = Ledger.load(state)
+        assert led.progress[key] == stop and key not in led.observations_done
+    res = CliRunner().invoke(app, args)
+    assert res.exit_code == 0, res.output
+    led = Ledger.load(state)
+    assert key in led.observations_done and key not in led.progress
+    assert led.channels == 6 * unit, "every channel searched exactly once"
+
+
+def test_bl_query_widens_past_rows_already_seen(monkeypatch):
+    """B11: the archive ignores offsets, so a fixed `limit` saw the same rows forever."""
+    from ai_seti.sources import BreakthroughListenSource
+
+    archive = [{"url": f"http://x/{i}.fil"} for i in range(30)]
+    asked = []
+
+    def fake_query(self, limit=None):
+        asked.append(limit)
+        return archive[:limit]
+
+    monkeypatch.setattr(BreakthroughListenSource, "query", fake_query)
+    src = BreakthroughListenSource(limit=5)
+    done = {r["url"] for r in archive[:12]}
+    assert [r["url"] for r in src.new_rows(done)] == [r["url"] for r in archive[12:17]]
+    assert asked == [5, 20]
+    assert src.new_rows({r["url"] for r in archive}) == []      # archive exhausted, no loop
+
+
+def test_failing_file_is_recorded_and_given_up_after_max_attempts(tmp_path, monkeypatch):
+    """B11: failures were printed and forgotten, so the same files failed on every run."""
+    from typer.testing import CliRunner
+
+    import ai_seti.sources as sources
+    from ai_seti.cli import app
+    from ai_seti.state import MAX_ATTEMPTS
+
+    fetched = []
+
+    class _Broken:
+        def __init__(self, *a, **k):
+            pass
+
+        def observations(self, done):
+            if "http://x/bad.fil" not in done:
+                fetched.append(1)
+                yield None, "error", None, {"url": "http://x/bad.fil", "error": "Corrupt header"}
+
+    monkeypatch.setattr(sources, "BreakthroughListenSource", _Broken)
+    state = tmp_path / "state.json"
+    args = ["crunch", "--source", "bl", "--state", str(state), "--no-live"]
+    for _ in range(MAX_ATTEMPTS + 1):
+        res = CliRunner().invoke(app, args)
+        assert res.exit_code == 0, res.output
+    assert len(fetched) == MAX_ATTEMPTS, "must stop retrying after MAX_ATTEMPTS"
+    entry = Ledger.load(state).failed["http://x/bad.fil"]
+    assert entry == {"attempts": MAX_ATTEMPTS, "reason": "Corrupt header"}
+    assert "1 file(s) skipped" in res.output
+
+
+def test_failed_work_unit_is_not_marked_searched(tmp_path, monkeypatch):
+    """Review: a unit that errored was still counted, so --max-units moved past a hole."""
+    import json as _json
+
+    import numpy as _np
+    from typer.testing import CliRunner
+
+    import ai_seti.pipeline as pipeline
+    from ai_seti.cli import app
+    from ai_seti.io.filterbank import FilterbankHeader, write_sigproc
+
+    unit = 8192
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    write_sigproc(raw / "obs.fil", _np.ones((16, 4 * unit), _np.float32), FilterbankHeader(
+        fch1=1420.0, foff=-2.7939677238464355e-06, nchans=4 * unit, tsamp=18.25, nsamples=16))
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"channels_per_unit": unit, "use_ai": False}))
+    real = pipeline.process_work_unit
+
+    def flaky(wu, c):
+        if wu.core_start == unit:
+            raise OSError("range request failed")
+        return real(wu, c)
+
+    monkeypatch.setattr(pipeline, "process_work_unit", flaky)
+    state = tmp_path / "state.json"
+    res = CliRunner().invoke(app, [
+        "crunch", "--source", "local", "--watch-dir", str(raw), "--max-units", "2",
+        "--state", str(state), "--outdir", str(tmp_path / "out"), "--no-live",
+        "--workers", "1", "--config", str(cfg)])
+    assert res.exit_code == 0, res.output
+    led = Ledger.load(state)
+    key = str(raw / "obs.fil")
+    assert key not in led.progress, "the range with a failed unit must be retried"
+    assert led.failed[key]["attempts"] == 1
+
+
+def test_same_signal_in_a_second_target_is_flagged_multi_target(tmp_path):
+    """B7: a tone present in two different pointings cannot come from either of them."""
+    import json as _json
+
+    import numpy as _np
+    import pandas as _pd
+    from typer.testing import CliRunner
+
+    from ai_seti.ai.simulate import Injection, inject, noise_waterfall
+    from ai_seti.cli import app
+    from ai_seti.io.filterbank import FilterbankHeader, write_sigproc
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    for name, target in (("a_obs", "HIP1"), ("b_obs", "HIP2")):
+        rng = _np.random.default_rng(1)
+        d = noise_waterfall(16, 32768, rng)
+        inject(d, Injection("technosignature_like", 12000, 1.5, 6.0, 1.0), rng)
+        write_sigproc(raw / f"{name}.fil", d, FilterbankHeader(
+            fch1=1420.0, foff=-2.7939677238464355e-06, nchans=32768, tsamp=18.25,
+            nsamples=16, source_name=target))
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text(_json.dumps({"channels_per_unit": 16384, "use_ai": False}))
+    res = CliRunner().invoke(app, [
+        "crunch", "--source", "local", "--watch-dir", str(raw), "--state", str(tmp_path / "s.json"),
+        "--outdir", str(tmp_path / "out"), "--no-live", "--workers", "1", "--config", str(cfg)])
+    assert res.exit_code == 0, res.output
+    first = _pd.read_csv(tmp_path / "out" / "a_obs" / "candidates.csv")
+    second = _pd.read_csv(tmp_path / "out" / "b_obs" / "candidates.csv")
+    tone = lambda df: df[(df["channel"] - 12000).abs() <= 3].iloc[0]  # noqa: E731
+    assert not tone(first)["multi_target"], "first sighting has nothing to match"
+    assert tone(second)["multi_target"]
+    assert tone(second)["interest"] < tone(first)["interest"]
+
+
+def test_same_target_seen_twice_is_not_multi_target():
+    """Re-observing the same target (a cadence ON scan) must not count as interference."""
+    import pandas as _pd
+
+    from ai_seti.rfi import flag_multi_target
+
+    df = _pd.DataFrame({"frequency_mhz": [1420.0001, 1500.0], "interest": [80.0, 60.0]})
+    out = flag_multi_target(df, [[1420.0, "HIP1"]], "HIP1")
+    assert not out["multi_target"].any()
+    out = flag_multi_target(df, [[1420.0, "HIP2"]], "HIP1")
+    assert out.set_index("frequency_mhz")["multi_target"].to_dict() == {1420.0001: True, 1500.0: False}
+    assert out.iloc[0]["frequency_mhz"] == 1500.0, "flagged hit drops below the clean one"

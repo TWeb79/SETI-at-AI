@@ -7,7 +7,10 @@ Applies to: **v0.3.0**. Opened at the end of the 0.3.0 hardening pass
 
 Updated 2026-10-03: B4–B15 added after a code review and the first runs against real
 Breakthrough Listen data (`ai-seti crunch --target HIP --max-units 8`). Those runs are
-summarised in [Real-data run 2026-10-03](#real-data-run-2026-10-03).
+summarised in [Real-data run 2026-10-03](#real-data-run-2026-10-03). B16–B17 added the same
+day after tracing every reader of `SearchConfig`'s drift limits. B18–B21 added after a
+second real-data run with the B4–B11 fixes in place, summarised in
+[Real-data run 2026-10-03, second pass](#real-data-run-2026-10-03-second-pass).
 
 Items are sorted by severity, then by the order they should be fixed in. **IDs are stable and
 must not be renumbered** — other documents and the tables below cross-reference them.
@@ -20,25 +23,30 @@ a plausible configuration · **low** = quality, debt or hygiene.
 | ID | Severity | Summary | Area |
 |---|---|---|---|
 | ~~B4~~ | high — **fixed** | ~~`remote_header` looped forever on an empty 206~~ | `io/remote.py` |
-| B6 | high | Coarse-channel mirror images rank as top `technosignature_like` candidates | new pipeline stage |
-| B8 | high | Classifier saturates at p=1.0 at any SNR — publishes RFI as a technosignature | `ai/model.py` |
-| B7 | high | The same signal in several targets is not recognised as interference | `sources.py`, `state.py` |
-| B5 | high | `--max-units` takes the top of the band, then marks the whole file done | `cli.py`, `state.py` |
+| ~~B6~~ | high — **fixed**, but see B18 | ~~Coarse-channel mirror images ranked as top `technosignature_like` candidates~~ | `rfi.py`, `pipeline.py` |
+| ~~B8~~ | high — **fixed** (simulator class open, see B3) | ~~Classifier saturates at p=1.0 at any SNR — publishes RFI as a technosignature~~ | `ai/model.py`, `pipeline.py`, `share.py` |
+| ~~B18~~ | high — **fixed** | ~~Mirror pairs about the coarse-channel centre have equal SNR; B6 demoted only one half~~ | `rfi.py` |
+| B7 | high — **(b) fixed**, (a) open | The same signal in several targets is not recognised as interference | `rfi.py`, `state.py`, `cli.py` |
+| ~~B5~~ | high — **fixed** | ~~`--max-units` took the top of the band, then marked the whole file done~~ | `cli.py`, `state.py` |
 | ~~B9~~ | high — **fixed** | ~~Drifts far beyond the configured limit were searched and reported~~ | `dsp/dedoppler.py` |
 | B1 | high | `drift_search` silently degenerates to a zero-drift-only search | `dsp/dedoppler.py` |
 | B2 | high | `foff_mhz` is unvalidated; Hz passed where MHz is expected blinds the search | `dsp/dedoppler.py` |
 | B3 | high | The classifier never sees the drift regime it must score in production | `ai/model.py` |
 | B10 | med | Non-power-of-two time samples roughly double the Taylor-tree cost | `dsp/dedoppler.py` |
-| B11 | med | Failed files are never recorded and the archive query never pages | `cli.py`, `sources.py` |
+| ~~B11~~ | med — **fixed** | ~~Failed files were never recorded and the archive query never paged~~ | `cli.py`, `sources.py`, `state.py` |
 | B12 | med | Every `.gpuspec.8.0001.fil` fails with "Corrupt SIGPROC header string" | `io/filterbank.py` |
+| ~~B19~~ | med — **fixed** (labelling; speed open) | ~~Mid-res products cannot resolve drift, yet every hit was reported as "does not drift"~~ | `pipeline.py`, `sources.py` |
+| B20 | med | Classifier training silently gets ~110 of 500 requested noise examples | `ai/model.py` |
+| B16 | med | Streamlit drift slider above ~4.9 Hz/s has no effect on high-res GBT data | `app.py` |
 | B13 | low | `ai-seti status` reports "reachable (0 sample rows)" and can hang silently | `cli.py` |
 | B14 | low | README commands fail when pasted into zsh | `README.md` |
 | B15 | low | The terminal dashboard leaves blank lines and torn panels | `dashboard.py` |
+| B21 | low | Multi-target match (B7b) misses the DC forest: neighbours across targets sit 4–7 kHz apart | `rfi.py` |
+| B17 | low | Shared findings omit `max_drift_ch_per_step`, the drift cap that can bind | `share.py` |
 
-**Suggested order.** B4 and B9 are done. Next is B6 + B8, which together decide whether any
-candidate this program produces is credible; then B5 + B11, which decide whether the program
-looks at all of the data. Then B7, which needs cadence plumbing. Then B1 + B2 + B3, then the
-rest.
+**Suggested order.** Done: B4, B5, B6, B8, B9, B11, B18, B19 and B7(b).
+Next is B20 (noise-class shortfall in training).
+Then B7(a), which needs cadence plumbing. Then B1 + B2 + B3, then the rest.
 
 ---
 
@@ -110,6 +118,16 @@ actually searched (shares the reporting requirement with B1).
 
 ### B6 — mirror images around the coarse-channel DC bin rank as top "technosignature_like" candidates
 
+> **Status: fixed.** Each hit now carries `mirror_channel`, the start channel of its image
+> about the coarse-channel DC bin (`pipeline.process_work_unit`, -1 when the channelisation is
+> unknown). `rfi.flag_mirror_images` matches partners within ±3 channels and opposite drift in
+> the same file, sets `mirror_pair` on both and `mirror_image` on the weaker, and the interest
+> of a `mirror_image` is multiplied by 0.2. The flag is in `candidates.csv`, explained in the
+> HTML report, listed in the share checklist, and blocks sharing in `passes_gate`.
+> **Real data contradicts the "weaker image" premise: see B18.**
+> Regression test: `test_mirror_image_about_coarse_centre_is_flagged_and_demoted`, which
+> checks the demotion factor itself, not only that the image is weaker.
+
 GBT/BL coarse channels show spectral images: a strong tone at `f_c + Δ` produces a weaker copy
 at `f_c − Δ` with the opposite drift sign, where `f_c` is the coarse-channel centre (DC bin).
 Nothing in the pipeline knows this.
@@ -135,6 +153,21 @@ Flag the weaker one `mirror_image` (and the pair `mirror_pair`), and multiply in
 centre; the weaker hit is flagged and drops below the stronger one by interest.
 
 ### B8 — the classifier saturates at p = 1.0 for any narrow, steady, drifting tone — at any SNR
+
+> **Status: fixed, except the simulator class.** A hit with SNR above 3× the classifier's
+> training maximum (`ai.model.ood_snr_limit`; `snr_max` is now recorded by `train()`, and the
+> bundled model falls back to 40.24, reproduced by retraining with the defaults) gets `ai_class = "out_of_distribution"`, its
+> p is replaced by the heuristic, and its interest is capped at 50. `share_require_cadence`
+> now defaults to `None`, meaning a cadence pass is required for github/webhook but not for
+> the local bundle (`--no-require-cadence` opts out). Regression tests:
+> `test_far_out_of_range_snr_is_not_trusted_as_technosignature`,
+> `test_uncadenced_finding_goes_to_bundle_but_not_remote_by_default`,
+> `test_far_out_of_range_snr_is_capped_without_a_classifier`. The SNR cap applies whether or
+> not a classifier is loaded, and `configs/default.json` no longer pins
+> `share_require_cadence: false`, which had kept the new sharing default from ever applying.
+> **Still open:** a strong-carrier RFI class in the simulator. It needs a retrain, so it goes
+> with B3. The guard is on SNR only: checking every feature range would currently mark almost
+> every production hit out of range, because of the drift gap in B3.
 
 Related to B3 (training distribution), but a separate failure: the classifier has no notion of
 being outside its training range. Measured with the bundled model on a narrow tone drifting
@@ -167,6 +200,18 @@ send uncadenced candidates to remote sinks by default.
 
 ### B7 — the same signal in different targets is not recognised as interference
 
+> **Status: (b) fixed, (a) open.** The ledger keeps `signals`: the frequencies of each
+> observation's 50 strongest candidates and their target (capped at 50,000 entries).
+> `rfi.flag_multi_target` flags a hit within 2 kHz of a frequency seen in a *different*
+> target, cuts its interest to a fifth and re-ranks. A repeat sighting in the same target, such
+> as a cadence ON scan, doesn't count. The flag is in the CSV, explained in the HTML report,
+> listed in the share checklist, and blocks sharing. Regression tests:
+> `test_same_signal_in_a_second_target_is_flagged_multi_target`,
+> `test_same_target_seen_twice_is_not_multi_target`.
+> **Still open:** (a), grouping archive files by `cadence_url` and running `cadence_filter`
+> automatically. The 2 kHz tolerance is a guess (see the comment in `rfi.py`). In a band dense
+> with interference it can flag a genuine hit that happens to sit near someone else's RFI.
+
 The signals at ~7999.70 and ~8000.28–8000.30 MHz appear in **HIP2579, HIP2586 and HIP3249**.
 These files sit under `LHS1140/C/` in the archive and were recorded on the same day
 (MJD 57774) in consecutive scans, so they are very likely the OFF pointings of an LHS 1140
@@ -185,6 +230,19 @@ is reduced.
 flagged `multi_target`.
 
 ### B5 — `--max-units` always crunches the top of the band, then marks the whole file done
+
+> **Status: fixed.** The ledger keeps `progress` (observation → next unsearched channel).
+> `Ledger.next_range` gives each run the next `max_units` units, and `Ledger.advance` marks the
+> observation done only when its last channel is searched. Partial runs write to
+> `<outdir>/<stem>_ch<start>-<stop>` so they don't overwrite each other's reports. Not done: the
+> optional "spread units across the band". Regression test:
+> `test_max_units_resumes_and_marks_done_only_when_whole_file_is_searched`, the first test that
+> drives `crunch` through the CLI. Follow-up from review: `split` now pads units into channels
+> outside `chan_range` (a chunk edge is not a data edge), and a range with a failed work unit
+> is recorded as a failure instead of being advanced past; `run_units` with one worker now
+> records unit errors like the process pool does instead of crashing. Tests:
+> `test_partial_range_units_are_padded_beyond_the_range_edges`,
+> `test_failed_work_unit_is_not_marked_searched`.
 
 `src/ai_seti/cli.py:219` builds `rng = (0, min(header.nchans, max_units * cfg.channels_per_unit))`
 — always the first units — and `cli.py:226` calls `ledger.done(url)` unconditionally afterwards.
@@ -264,7 +322,91 @@ cost is high (27 Taylor-tree passes per sign per example, ~0.27 s/example, and r
 examples are retried up to `n_per_class * 4` times). Budget for a reduced sweep before
 committing to it.
 
+### B18 — mirror pairs about the coarse-channel centre have equal SNR, so B6 leaves one half at #1
+
+> **Status: fixed.** `rfi.flag_mirror_images` now flags *both* halves `mirror_image` when their
+> SNRs are within `SYMMETRIC_PAIR_RATIO` = 2 of each other, and keeps the weaker-only rule for
+> unequal pairs. Re-flagging the saved candidates from the second real-data run: images 81 → 162
+> (HIP2579) and 77 → 154 (HIP3249). The best interest in either file falls from 70.7 to ≤ 16,
+> and every top-10 candidate is now a flagged image. Report and share-gate wording no longer
+> say "weaker". Regression test: `test_symmetric_mirror_pair_flags_both_halves` (symmetric pair,
+> unequal pair, unpaired tone). The density flag suggested below is not done; B21 covers it.
+
+B6 assumed an image is a *weaker* copy ("a strong tone at `f_c + Δ` produces a weaker copy at
+`f_c − Δ`") and demotes only the weaker hit of each pair. The second real-data run shows this is
+wrong for these products. In the first two coarse channels of HIP2579 `.0000` and HIP3249
+`.0000`:
+
+| file | hits | pairs found | SNR ratio strong/weak (median, p90) | hits within 0.6 MHz of `f_c` |
+|---|---|---|---|---|
+| HIP2579 `.0000` | 166 | 81 | 1.02, 1.08 | 93% |
+| HIP3249 `.0000` | 158 | 77 | 1.02, 1.07 | 92% |
+
+Every one of the top 10 candidates in both files is the marginally stronger half of such a pair
+(ratios 1.00–1.10). So the #1 candidate is still a symmetric artefact. In HIP2579 it is
+8000.344291 MHz, −0.071 Hz/s, SNR 32, `technosignature_like`, **interest 70.7**: above
+`share_min_interest`, the new lifetime best, and it goes into the local share bundle.
+`f_c` = 7999.999999 MHz (`fch1 + foff · 2^19`) in both files, and each partner sits within one
+channel of `2·f_c − f`, so the pairing itself is right. Only the "weaker" rule is wrong.
+
+**Fix.** When a pair's SNR ratio is below a threshold (say 2), flag *both* halves
+`mirror_image`: a symmetric pair is an instrument product, not a sky tone with its echo. Keep
+the weaker-only rule for strongly unequal pairs. Consider also a density flag: 92–93% of hits
+within ±0.6 MHz of `f_c` says that region is a spur forest in this receiver chain.
+
+**Test.** Inject a tone and a mirror of equal amplitude; both must be flagged and drop below an
+unpaired tone of the same SNR.
+
 ## Medium
+
+### B19 — mid-res products cannot resolve drift, yet every hit is called "does not drift"
+
+> **Status: fixed (labelling); speed open.** `sources.drift_resolvable(header, cfg)` checks
+> whether `max_drift_rate_hz_s × nsamples × tsamp` reaches one channel. When it doesn't, every hit
+> gets `drift_unresolved = True`. The ×0.3 zero-drift penalty is not applied. The report says
+> "drift not measurable at this resolution" instead of "does not drift". The share checklist
+> shows the drift check as unknown, and the gate refuses with "drift not measurable at this
+> resolution (cannot rule out Earth)". `crunch` prints a notice, and `metadata.json` records
+> `drift_resolvable`. Regression test: `test_midres_hits_are_drift_unresolved_not_stationary`.
+> **Still open:** these products still cost ~2 min each (load-bound). Skipping them
+> automatically in `crunch` is a behaviour decision and has not been made.
+
+The `.0002` product is 2,861 Hz × 1.07 s × 272 samples. At the 4 Hz/s limit, the largest drift
+over the whole observation is 4 × 292 s ≈ 1,170 Hz, which is less than one channel. So drift is
+*unmeasurable*, not zero. Every hit in both `.0002` files came out `zero_drift` (13/13 and
+16/16). It got the ×0.3 zero-drift penalty (all interest ≤ 10). The HTML report says "it does
+not drift, which usually means a transmitter on Earth", and the share gate rejects it as "zero
+drift (almost always terrestrial)". Those statements are not supported by the data.
+
+The files are also expensive. Each took 107–121 s for 1 M channels (8.7–9.8 k channels/s,
+against 118–130 k on `.0000`). One remote 66 k-channel unit timed by stage: **load 48.4 s**,
+preprocess 0.25 s, de-Doppler 0.01 s, detectors 0.01 s, AI 0.38 s. So the time is the HTTP
+Range streaming of 272 rows per unit, not the search (see B10).
+
+**Fix.** Compute "maximum resolvable drift" (`foff / (nsamples · tsamp)`) per file. When the
+configured rate cannot reach one channel over the observation, either skip the product with a
+clear message (preferring `.0000`), or label hits `drift_unresolved` and leave out the
+zero-drift penalty and the "does not drift" wording. Record the choice in `metadata.json`.
+
+**Test.** A `.0002`-shaped header with an injected tone: the hit is not labelled `zero_drift`,
+and the report text does not claim it is stationary.
+
+### B20 — classifier training silently gets ~110 of 500 requested noise examples
+
+`ai-seti train --per-class 500` (seed 0, 22 s) completed with test accuracy 0.957, but built only
+2,611 examples instead of 3,000. The confusion matrix has 28 noise test rows against 125 for
+every other class, so about 110 noise examples in total. `_training_example("noise")`
+(`ai/model.py:52`) keeps an example only if pure noise produces a hit above SNR 5, which is rare.
+`build_training_set` gives up after `n_per_class × 4` tries without saying so, and the progress
+bar never reaches 100%. The bundled model has the same shortfall: same `n_train` = 1,958 and
+identical accuracy.
+
+**Fix.** Lower the hit threshold for noise examples only, or take the strongest noise path from
+the SNR map, so the class can be filled. Log a warning, and record per-class counts in the
+model metadata, when any class falls short.
+
+**Test.** `build_training_set(n_per_class=50)` returns 50 rows of every label, or warns and
+reports the shortfall.
 
 ### B10 — non-power-of-two time samples double the Taylor-tree cost
 
@@ -273,12 +415,26 @@ committing to it.
 T = 279 vs 0.31 s at T = 256**. In the log, mid-res units ran at 8–9 k channels/s (110–124 s
 per file), versus 125–137 k channels/s on high-resolution data.
 
+**Update after the second run.** On mid-res data the tree no longer costs anything after B9
+(de-Doppler 0.01 s per unit). The 107–121 s per file is Range streaming (load 48.4 s of 49.2 s
+per unit, see B19). This item now only matters for products where a tree is needed and T is not
+a power of two.
+
 **Fix.** After B9 most mid-res runs need no tree at all. Where a tree is needed, split time into
 power-of-two segments and combine, or decimate to the largest power of two below T.
 
 **Test.** Timing guard: T = 279 costs ≤ 1.2× T = 256 on the same width.
 
 ### B11 — failed files are never recorded, and the archive query never pages
+
+> **Status: fixed.** Checked against the live API on 2026-10-03: `offset`, `page` and `skip`
+> are ignored, but the order is stable across `limit` values. So
+> `BreakthroughListenSource.new_rows` widens the query (×4, up to 2,000 rows) until it holds
+> `limit` rows not yet done. Failures go into the ledger's `failed` map (attempt count and last
+> reason). After `state.MAX_ATTEMPTS` = 3 the file is skipped, and a later success clears the
+> entry. Each pass prints "N crunched, M failed; K skipped". Regression tests:
+> `test_bl_query_widens_past_rows_already_seen`,
+> `test_failing_file_is_recorded_and_given_up_after_max_attempts`.
 
 `cli.py:212-214` prints `skip` and continues, but nothing is written to the ledger, so the same
 three files are fetched and fail on every run. `BreakthroughListenSource.query()`
@@ -305,6 +461,21 @@ product contains a longer or unexpected string field.
 **Next step.** On failure, log the URL, HTTP status, `Content-Type` and the first 64 bytes (hex);
 compare with `watutil -i` from blimpy on the same file. Fix depends on the finding. Independently,
 reject non-SIGPROC responses early with a clear message rather than a parser error.
+
+### B16 — the Streamlit drift slider above ~4.9 Hz/s has no effect on high-res GBT data
+
+`app.py:21` offers `max_drift_rate_hz_s` from 0.5 to 10 Hz/s, but leaves
+`max_drift_ch_per_step` at its default of 32 (`config.py:18`). On a GBT high-resolution product
+(`tsamp` ≈ 18.25 s, `foff` ≈ 2.794 Hz) one channel/step is ≈ 0.153 Hz/s, so the cap limits
+the search to ≈ 4.9 Hz/s. Both `sources.drift_ceil_ch_per_step` and `drift_search` take the
+smaller of the two limits, so slider values 5–10 Hz/s silently search the same space as 4.9.
+
+**Fix.** After the header is read, show the effective limit next to the slider
+(`min(rate, cap · foff / tsamp)`), and either raise `max_drift_ch_per_step` with the slider or
+clamp the slider's maximum to the effective limit.
+
+**Test.** For a high-res header and `max_drift_rate_hz_s = 10`, the reported effective rate equals
+`32 · foff_hz / tsamp`.
 
 ## Low
 
@@ -338,6 +509,29 @@ half-drawn "no data yet" panel followed by a full redraw).
 **Fix.** Print through `live.console.print(...)` while live, and render a `Group` sized to
 content instead of a full-height `Layout`.
 
+### B21 — multi-target matching (B7b) misses the spur forest around the coarse-channel centre
+
+In the second run B7(b) flagged 2 of 166 hits in HIP2579 `.0000` and 59 of 158 in HIP3249
+`.0000`. But the top candidates were not flagged: HIP3249's 7999.583600 and 8000.348557 MHz
+sit 4–7 kHz from the nearest hits in the other targets, beyond the 2 kHz tolerance. The same
+±0.6 MHz forest around `f_c` appears in all three targets (B18), so it is the same
+interference. It just doesn't land on the same frequencies. Exact-frequency matching is the
+wrong granularity for it.
+
+**Fix.** Mostly resolved by B18. Optionally add a band-level check (hit density per 100 kHz
+seen in other targets), and make the tolerance a config value.
+
+### B17 — shared findings omit `max_drift_ch_per_step`, the drift cap that can bind
+
+`share.py:36` `CONFIG_KEYS` records `max_drift_rate_hz_s` but not `max_drift_ch_per_step`.
+With the defaults the rate limit binds on high-res data (≈ 26 < 32 ch/step), but a user who
+lowers the cap, or searches at > 4.9 Hz/s (see B16), publishes a finding whose recorded config
+does not show the limit that was actually applied, so it cannot be reproduced from the record.
+
+**Fix.** Add `"max_drift_ch_per_step"` to `CONFIG_KEYS`.
+
+**Test.** `build_findings()` output contains `max_drift_ch_per_step` under the config block.
+
 ---
 
 ## Real-data run 2026-10-03
@@ -366,6 +560,40 @@ Listen archive.
 **Bottom line.** None of the candidates from this run is credible: the top ones are a
 coarse-channel image artefact present in several targets. The run is still useful as the first
 end-to-end test on real data, and it exposed failure modes the synthetic benchmarks cannot.
+
+## Real-data run 2026-10-03, second pass
+
+Same target filter, with B4–B9, B11 and the review fixes in place:
+`ai-seti crunch --target HIP --max-units 8 --limit 4 --no-live` with a fresh ledger, 10 cores.
+Four observations: HIP2586 `.0002`, HIP2579 `.0000` and `.0002`, HIP3249 `.0000`. Exit 0.
+
+**Worked.**
+- **Errors:** none. 4 crunched, 0 failed, and no warnings in the log.
+- **`--max-units`:** stored `progress` = 2,097,152 for each high-res file, and did not mark it
+  done (B5).
+- **Classifier:** loaded in every file (no `ai_note`) and scored all 353 hits.
+- **Out-of-distribution guard (B8):** labelled 4–33 hits per file `out_of_distribution` and
+  capped them. The SNR 144,777-style lifetime best is gone.
+- **Mirror flag (B6):** fires on 162 and 154 hits. **Multi-target flag (B7b):** fires on 2 and
+  59.
+- **High-res throughput:** 118–130 k channels/s, unchanged.
+
+**AI training.** `ai-seti train --per-class 500` to a scratch path: 22 s, test accuracy 0.957,
+`snr_max` = 40.24 now recorded. This showed that B8's fallback constant (34.0, measured with
+400 per class) was wrong for the bundled model; it is corrected to 40.24. Training also short-
+changes the noise class (B20).
+
+| Symptom | Cause |
+|---|---|
+| #1 candidate HIP2579 8000.344291 MHz, `technosignature_like`, interest 70.7 | B18: symmetric mirror pairs, only one half demoted |
+| 92–93% of high-res hits within ±0.6 MHz of the coarse-channel centre | B18 (spur forest) |
+| Every mid-res hit `zero_drift`, interest ≤ 10, "does not drift" in the report | B19 |
+| Mid-res files 107–121 s each; 98% of it is loading | B19, B10 (updated) |
+| Top HIP3249 hits not flagged multi-target | B21 |
+
+**Bottom line.** The fixes did what they were meant to, but the top candidates are still
+artefacts, now for a reason B6 did not anticipate (B18). Mid-res products should be skipped or
+labelled honestly (B19) rather than crunched for 2 minutes each.
 
 ---
 

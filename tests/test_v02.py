@@ -178,3 +178,47 @@ def test_cadence_filter_keeps_on_only_signal():
     ]
     ev = cadence_filter(scans)
     assert list(ev["frequency_mhz"]) == [1420.0]
+
+
+def test_mirror_image_about_coarse_centre_is_flagged_and_demoted(tmp_path):
+    """B6: a weaker copy at 2*f_c - f with opposite drift is an instrument artefact."""
+    n_chan, nfine = 65536, 16384
+    dc = nfine // 2
+    rng = np.random.default_rng(6)
+    d = noise_waterfall(16, n_chan, rng)
+    inject(d, Injection("technosignature_like", dc + 3000, 2.5, 10.0, 1.0), rng)
+    inject(d, Injection("technosignature_like", dc - 3000, -2.5, 4.0, 1.0), rng)
+    hdr = FilterbankHeader(fch1=1420.0, foff=-2.7939677238464355e-06, nchans=n_chan,
+                           tsamp=18.253611008, nsamples=16, source_name="TEST")
+    p = tmp_path / "m.fil"
+    write_sigproc(p, d, hdr)
+    hdr = read_header(p)
+    cfg = SearchConfig(channels_per_unit=16384, workers=1, fine_channels_per_coarse=nfine)
+    results = list(run_units(split(str(p), hdr, cfg), cfg, workers=1))
+    cands = score_candidates(results, cfg)
+    strong = cands[(cands["channel"] - (dc + 3000)).abs() <= 3].iloc[0]
+    mirror = cands[(cands["channel"] - (dc - 3000)).abs() <= 3].iloc[0]
+    assert strong["mirror_pair"] and mirror["mirror_pair"]
+    assert mirror["mirror_image"] and not strong["mirror_image"]
+    unflagged = score_candidates(
+        [{**r, "hits": [{**h, "mirror_channel": -1} for h in r["hits"]]} for r in results], cfg)
+    plain = unflagged[(unflagged["channel"] - (dc - 3000)).abs() <= 3].iloc[0]["interest"]
+    assert mirror["interest"] == pytest.approx(0.2 * plain, abs=0.2)   # demoted, not just weaker
+    unrelated = cands[~cands["mirror_pair"]]
+    assert not unrelated["mirror_image"].any()
+
+
+def test_symmetric_mirror_pair_flags_both_halves():
+    """B18: on real BL data both halves of a pair have equal SNR; neither is a sky tone."""
+    from ai_seti.rfi import flag_mirror_images
+
+    df = pd.DataFrame({
+        "unit_id": ["f:0-1"] * 5,
+        "channel":          [11192, 5192, 30000, 2000, 50000],
+        "mirror_channel":   [5192, 11192, 2000, 30000, 9000],
+        "drift_ch_per_step": [0.3, -0.3, 0.5, -0.5, 0.2],
+        "snr":              [32.0, 31.5, 40.0, 4.0, 35.0]})
+    out = flag_mirror_images(df).set_index("channel")["mirror_image"].to_dict()
+    assert out == {11192: True, 5192: True,       # symmetric pair: both are artefacts
+                   30000: False, 2000: True,      # 10x unequal: only the image
+                   50000: False}                  # no partner: untouched

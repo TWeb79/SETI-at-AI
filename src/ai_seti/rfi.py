@@ -24,6 +24,72 @@ def in_known_rfi_band(freq_mhz: np.ndarray, bands) -> np.ndarray:
     return out
 
 
+# Below this strong/weak SNR ratio a pair is symmetric: both halves are the instrument's,
+# neither is a sky tone with its echo. Real BL pairs measured 1.00-1.10 (backlog B18).
+SYMMETRIC_PAIR_RATIO = 2.0
+
+
+def flag_mirror_images(df: pd.DataFrame, tol_ch: int = 3,
+                       symmetric_ratio: float = SYMMETRIC_PAIR_RATIO) -> pd.DataFrame:
+    """Flag spectral images mirrored about a coarse-channel DC bin (backlog B6).
+
+    GBT/BL coarse channels show a weaker copy of a strong tone at ``2*f_c - f`` with the
+    opposite drift. ``mirror_channel`` (set per hit by the pipeline, -1 when the coarse
+    channelisation is unknown) is where that partner would start. Within one file, both hits
+    of a matching pair get ``mirror_pair``. ``mirror_image`` goes to the weaker one, or to both
+    when their SNRs are within ``symmetric_ratio`` of each other (B18).
+    """
+    df["mirror_pair"] = False
+    df["mirror_image"] = False
+    if "mirror_channel" not in df or df.empty:
+        return df
+    stem = df["unit_id"].astype(str).str.rsplit(":", n=1).str[0]
+    for _, g in df.groupby(stem):
+        order = g["channel"].to_numpy().argsort()
+        chans = g["channel"].to_numpy()[order]
+        idx = g.index.to_numpy()[order]
+        for i, mc, d, snr in zip(g.index, g["mirror_channel"], g["drift_ch_per_step"], g["snr"],
+                                 strict=True):
+            if mc < 0:
+                continue
+            lo = int(np.searchsorted(chans, mc - tol_ch, side="left"))
+            hi = int(np.searchsorted(chans, mc + tol_ch, side="right"))
+            for j in idx[lo:hi]:
+                dj = df.at[j, "drift_ch_per_step"]
+                if j == i or abs(d + dj) > max(0.25, 0.1 * abs(d)):
+                    continue
+                df.loc[[i, j], "mirror_pair"] = True
+                snr_j = df.at[j, "snr"]
+                if max(snr, snr_j) < symmetric_ratio * min(snr, snr_j):
+                    df.loc[[i, j], "mirror_image"] = True
+                else:
+                    df.at[j if (snr_j, j) < (snr, i) else i, "mirror_image"] = True
+    return df
+
+
+MULTI_TARGET_TOL_MHZ = 0.002    # 2 kHz: covers a few Hz/s of drift between scans
+
+
+def flag_multi_target(df: pd.DataFrame, seen: list, target: str,
+                      tol_mhz: float = MULTI_TARGET_TOL_MHZ) -> pd.DataFrame:
+    """Flag hits already seen in a *different* target (backlog B7).
+
+    A signal present in several pointings cannot come from any one of them; it is the
+    strongest interference evidence there is. `seen` is the ledger's [freq_mhz, target] list.
+    Flagged hits get `multi_target` and a fifth of their interest, then the frame is re-ranked.
+    """
+    df["multi_target"] = False
+    other = np.array(sorted(f for f, t in seen if t != target), dtype=float)
+    if df.empty or not len(other):
+        return df
+    f = df["frequency_mhz"].to_numpy(dtype=float)
+    i = np.clip(np.searchsorted(other, f), 1, len(other)) - 1
+    nearest = np.minimum(np.abs(other[i] - f), np.abs(other[np.minimum(i + 1, len(other) - 1)] - f))
+    df["multi_target"] = nearest <= tol_mhz
+    df["interest"] = np.where(df["multi_target"], (df["interest"] * 0.2).round(1), df["interest"])
+    return df.sort_values("interest", ascending=False).reset_index(drop=True)
+
+
 def is_off_scan(name: str) -> bool:
     return "_OFF" in name.upper()
 

@@ -37,6 +37,14 @@ quality gates enforceable.
 | 25 | State the drift-search and classifier-drift limitations in the README | `README.md` | done |
 | 26 | B4: stop `remote_header` re-requesting a range that returns no bytes | `io/remote.py` | done |
 | 27 | B9: never report a drift rate above `max_drift_rate_hz_s` | `dsp/dedoppler.py` | done |
+| 28 | B6: flag and demote mirror images about the coarse-channel DC bin | `rfi.py`, `pipeline.py`, `share.py`, `report.py` | done |
+| 29 | B8: out-of-distribution SNR guard, interest cap, cadence required for remote shares | `ai/model.py`, `pipeline.py`, `share.py`, `config.py` | done |
+| 30 | B5: `--max-units` resumes where the last run stopped; done only when fully searched | `state.py`, `cli.py` | done |
+| 31 | B11: record failed files (give up after 3), widen the archive query past seen rows | `state.py`, `sources.py`, `cli.py` | done |
+| 32 | Review fixes for 28–31: config default, chunk-edge padding, SNR cap without a model, unit errors | `configs/default.json`, `sources.py`, `pipeline.py`, `cli.py` | done |
+| 33 | B7(b): flag frequencies already seen in a different target (lifetime ledger index) | `rfi.py`, `state.py`, `cli.py`, `share.py`, `report.py` | done |
+| 34 | B18: flag both halves of a symmetric mirror pair | `rfi.py`, `report.py`, `share.py` | done |
+| 35 | B19: label hits `drift_unresolved` where drift cannot move a tone one channel | `sources.py`, `pipeline.py`, `share.py`, `report.py`, `cli.py` | done |
 
 ## Test plan
 

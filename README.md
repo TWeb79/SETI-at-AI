@@ -78,7 +78,9 @@ ai-seti crunch --target HIP --max-units 8               # fetch new BL observati
 
 `analyze` searches one file, once. `crunch` is the SETI@home-style loop: it asks the
 Breakthrough Listen archive for work, processes everything it has not seen, and remembers
-what it already did in `data/state.json`.
+what it already did in `data/state.json`. `--max-units N` caps each observation at N units
+per run; the next run continues at the next channel, and an observation only counts as done
+once every channel has been searched.
 
 Before hunting for aliens, it is worth checking the file you have is sane:
 
@@ -191,8 +193,11 @@ ai-seti crunch --auto-share        # share after every observation, using share_
 - **Same signal, same ID:** finding IDs come from the data file + frequency (10 Hz bins) +
   drift (0.05 Hz/s bins), so independent volunteers' reports of one signal collapse together.
 
-Guard rails: remote destinations need `--yes` (or `--auto-share`); zero-drift signals and
-signals in known RFI bands are never sent; synthetic/demo data stays local unless
+Guard rails: remote destinations need `--yes` (or `--auto-share`), and only receive findings
+that passed an ON/OFF cadence (`--cadence-events`) unless you pass `--no-require-cadence`;
+zero-drift signals, signals in known RFI bands and coarse-channel mirror images are never sent;
+hits far above the classifier's training SNR are labelled `out_of_distribution` and capped at
+interest 50; synthetic/demo data stays local unless
 `--allow-synthetic`; local paths are stripped and your name is only included with
 `--handle`; the ledger never sends the same finding to the same place twice. Every record
 is marked `unverified_candidate`. If something ever survives cadence, an independent
@@ -206,7 +211,7 @@ directly rather than post publicly.
 | Time-median spectrum: any tone drifting > ~1 channel over the observation is erased. Real ET signals always drift (planet rotation/orbit). | Taylor-tree de-Doppler search over ±`max_drift_rate_hz_s`, both signs; shear trick for drifts > 1 ch/step; zero-copy strided views. |
 | Global median/MAD: bandpass ripple inflates the noise estimate; DC spike of every GBT coarse channel flagged. | Robust piecewise bandpass + per-block MAD noise; DC bins repaired (coarse width auto-detected from `foff`). |
 | Whole selection loaded via blimpy, single core. | Memory-mapped SIGPROC / chunked HDF5 reader; overlapping work units; process pool (1 BLAS thread per worker); HTTP Range streaming. |
-| No RFI handling, no AI. | Known-band flags, zero-drift penalty, ON/OFF cadence filter; gradient-boosted hit classifier + isolation-forest anomaly score → 0–100 interest score. |
+| No RFI handling, no AI. | Known-band flags, zero-drift penalty, coarse-channel mirror-image flag, ON/OFF cadence filter; gradient-boosted hit classifier + isolation-forest anomaly score → 0–100 interest score. |
 | Only one signal type. | + SETI@home-style spikes, + Astropulse-style dispersed pulses (for high-time-resolution products). |
 | Test fixture crashed for < 701 channels. | Fixed; 72 tests incl. a local Range-server streaming test, mocked GitHub/webhook sharing, and a drift search at real GBT coarse-channel resolution. |
 

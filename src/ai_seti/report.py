@@ -117,7 +117,8 @@ def write_outputs(results: list[dict], candidates: pd.DataFrame, outdir: Path, c
 
 def write_html(path: Path, candidates: pd.DataFrame, results: list[dict], meta: dict) -> None:
     keep = ["frequency_mhz", "drift_rate_hz_s", "snr", "interest", "ai_class", "anomaly",
-            "bandwidth_ch", "on_fraction", "zero_drift", "known_rfi_band", "unit_id",
+            "bandwidth_ch", "on_fraction", "zero_drift", "drift_unresolved", "known_rfi_band", "mirror_image",
+            "multi_target", "unit_id",
             "p_technosignature_like", "_snippet"]
     top = candidates.head(REPORT_TOP)
     cands = []
@@ -284,18 +285,21 @@ function select(i){
   const c=D.candidates[i]; if(!c) return;
   document.querySelectorAll("#rows tr").forEach((tr,j)=>tr.setAttribute("aria-selected", j===i));
   $("headline").textContent = i===0 ? "Best signal of this run" : `Candidate ${i+1}`;
-  $("lede").textContent = `${D.target}${D.telescope? " ("+D.telescope+")":""} — a ${c.zero_drift? "non-drifting":"drifting"} narrowband tone`;
+  $("lede").textContent = `${D.target}${D.telescope? " ("+D.telescope+")":""} — a ${c.drift_unresolved? "narrowband tone (drift not measurable at this resolution)" : (c.zero_drift? "non-drifting narrowband tone":"drifting narrowband tone")}`;
   $("score").innerHTML = `${fmt(c.interest,0)}<small>/ 100 interest</small>`;
   $("readout").innerHTML = [["Frequency",fmt(c.frequency_mhz,6)+" MHz"],["Drift rate",fmt(c.drift_rate_hz_s,3)+" Hz/s"],
     ["De-Doppler SNR",fmt(c.snr,1)],["AI says",(c.ai_class||"–").replaceAll("_"," ")],
     ["P(technosignature-like)",fmt(c.p_technosignature_like,2)],["Unusualness",fmt(c.anomaly,2)]]
     .map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join("");
   const reasons=[];
-  if(!c.zero_drift) reasons.push("it drifts, as a transmitter on a rotating, orbiting planet would");
+  if(c.drift_unresolved) reasons.push("this data's channels are too wide to see any drift, so it cannot tell a moving source from one on Earth");
+  else if(!c.zero_drift) reasons.push("it drifts, as a transmitter on a rotating, orbiting planet would");
   else reasons.push("it does not drift, which usually means a transmitter on Earth (score reduced)");
   if(c.bandwidth_ch<=3) reasons.push("it is only "+fmt(c.bandwidth_ch,0)+(c.bandwidth_ch>=1.5?" channels":" channel")+" wide, and nature rarely makes tones this narrow");
   if(c.on_fraction>=.75) reasons.push("it is present in "+Math.round(c.on_fraction*100)+"% of time samples");
   if(c.known_rfi_band) reasons.push("but it sits in a band crowded with satellites (score halved)");
+  if(c.multi_target) reasons.push("but the same frequency turned up in a different target, so it cannot come from this one (score cut to a fifth)");
+  if(c.mirror_image) reasons.push("but it is mirrored across the coarse-channel centre by a partner of equal or greater strength, an instrument artefact (score cut to a fifth)");
   $("why").textContent = "It scores "+fmt(c.interest,0)+" because "+reasons.join("; ")+".";
   drawSky(c._snippet);
 }

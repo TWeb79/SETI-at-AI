@@ -13,6 +13,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+MAX_ATTEMPTS = 3    # a file that fails this often is skipped until the ledger is reset
+SIGNALS_PER_OBS = 50      # strongest candidates remembered per observation for B7
+# ponytail: flat list, capped; a sorted on-disk index if lifetime runs outgrow it.
+MAX_SIGNALS = 50_000
+
 
 @dataclass
 class Ledger:
@@ -24,6 +29,9 @@ class Ledger:
     hits: int = 0
     best: dict = field(default_factory=dict)
     shared: dict = field(default_factory=dict)      # finding_id -> [destinations]
+    progress: dict = field(default_factory=dict)    # observation -> next unsearched channel
+    failed: dict = field(default_factory=dict)      # observation -> {"attempts", "reason"}
+    signals: list = field(default_factory=list)     # [frequency_mhz, target] seen so far
     started_utc: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @classmethod
@@ -55,6 +63,35 @@ class Ledger:
     def done(self, obs: str) -> None:
         if obs not in self.observations_done:
             self.observations_done.append(obs)
+
+    def remember_signals(self, freqs_mhz, target: str) -> None:
+        """Keep the run's strongest frequencies so a later target can recognise them."""
+        self.signals += [[float(f), target] for f in list(freqs_mhz)[:SIGNALS_PER_OBS]]
+        self.signals = self.signals[-MAX_SIGNALS:]
+
+    def fail(self, obs: str, reason: str) -> None:
+        entry = self.failed.setdefault(obs, {"attempts": 0, "reason": ""})
+        entry["attempts"] += 1
+        entry["reason"] = reason
+
+    def skip(self) -> set[str]:
+        """Observations not to fetch again: finished ones and ones that keep failing."""
+        gave_up = {k for k, v in self.failed.items() if v.get("attempts", 0) >= MAX_ATTEMPTS}
+        return set(self.observations_done) | gave_up
+
+    def next_range(self, obs: str, nchans: int, max_chans: int = 0) -> tuple[int, int]:
+        """Channels to search this run: resume where a partial (--max-units) run stopped."""
+        start = int(self.progress.get(obs, 0))
+        return start, min(nchans, start + max_chans) if max_chans else nchans
+
+    def advance(self, obs: str, stop: int, nchans: int) -> None:
+        """Record that channels up to `stop` are searched; done only once all of them are."""
+        self.failed.pop(obs, None)
+        if stop >= nchans:
+            self.progress.pop(obs, None)
+            self.done(obs)
+        else:
+            self.progress[obs] = stop
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -85,13 +85,13 @@ def test_record_is_stable_private_and_gated(tmp_path):
 def test_webhook_and_ledger_dedup(tmp_path, server):
     recs = build_findings(_report(tmp_path), top=5)
     ledger = Ledger(path=tmp_path / "state.json")
-    res, skipped = share(recs, ["bundle", "webhook"], bundle_dir=tmp_path / "share",
+    res, skipped = share(recs, ["bundle", "webhook"], bundle_dir=tmp_path / "share", require_cadence=False,
                          ledger=ledger, webhook=server + "/hook", webhook_format="discord")
     assert [r.ok for r in res] == [True, True]
     assert (tmp_path / "share" / f"{recs[0]['finding_id']}.zip").exists()
     assert "content" in _Capture.posts[0][1]
     assert any("zero drift" in why for _, why in skipped)   # RFI never sent
-    res2, skipped2 = share(recs, ["webhook"], bundle_dir=tmp_path / "share", ledger=ledger,
+    res2, skipped2 = share(recs, ["webhook"], bundle_dir=tmp_path / "share", ledger=ledger, require_cadence=False,
                            webhook=server + "/hook")
     assert res2 == [] and any("already shared" in w for _, w in skipped2)
 
@@ -99,16 +99,24 @@ def test_webhook_and_ledger_dedup(tmp_path, server):
 def test_github_issue_created_once(tmp_path, server, monkeypatch):
     monkeypatch.setenv("AI_SETI_GITHUB_TOKEN", "t0ken")
     recs = build_findings(_report(tmp_path), top=1)
-    res, _ = share(recs, ["github"], bundle_dir=tmp_path, repo="org/finds", github_api=server)
+    res, _ = share(recs, ["github"], bundle_dir=tmp_path, repo="org/finds", github_api=server, require_cadence=False)
     assert res[0].ok and _Capture.posts[0][0] == "/repos/org/finds/issues"
     assert _Capture.posts[0][2] == "Bearer t0ken"
     assert recs[0]["finding_id"] in _Capture.posts[0][1]["title"]
     _Capture.existing = 1                                    # someone already reported it
-    res, _ = share(recs, ["github"], bundle_dir=tmp_path, repo="org/finds", github_api=server)
+    res, _ = share(recs, ["github"], bundle_dir=tmp_path, repo="org/finds", github_api=server, require_cadence=False)
     assert "already reported" in res[0].detail and len(_Capture.posts) == 1
 
 
 def test_synthetic_data_stays_local(tmp_path, server):
     recs = build_findings(_report(tmp_path, source="synthetic"), top=1)
-    res, skipped = share(recs, ["webhook"], bundle_dir=tmp_path, webhook=server)
+    res, skipped = share(recs, ["webhook"], bundle_dir=tmp_path, webhook=server, require_cadence=False)
     assert res == [] and "synthetic" in skipped[0][1] and _Capture.posts == []
+
+
+def test_uncadenced_finding_goes_to_bundle_but_not_remote_by_default(tmp_path, server):
+    """B8: without an explicit opt-out, only cadence-passing finds are published."""
+    recs = build_findings(_report(tmp_path), top=5, min_interest=0)[:1]
+    res, skipped = share(recs, ["bundle", "webhook"], bundle_dir=tmp_path / "share", webhook=server)
+    assert [r.destination for r in res] == ["bundle"] and _Capture.posts == []
+    assert any("no cadence pass" in why for _, why in skipped)

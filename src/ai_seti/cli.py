@@ -34,8 +34,14 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
     from .dashboard import CrunchDashboard
     from .pipeline import run_units, score_candidates
     from .report import write_outputs
-    from .sources import split
+    from .sources import drift_resolvable, split
 
+    resolvable = drift_resolvable(header, cfg)
+    if not resolvable:
+        print(f"[yellow]Drift is not measurable here: {abs(header.foff) * 1e6:,.0f} Hz channels, "
+              f"{header.nsamples * header.tsamp:,.0f} s scan, {cfg.max_drift_rate_hz_s:g} Hz/s "
+              "limit. Hits are labelled drift_unresolved; prefer the high-resolution product."
+              "[/yellow]")
     units = split(location, header, cfg, kind, chan_range=chan_range, meta=meta)
     dash = CrunchDashboard(len(units), ledger)
     dash.meta = meta
@@ -58,13 +64,19 @@ def crunch_observation(location, kind, header, meta, cfg: SearchConfig, outdir: 
                   + (f"  [red]{res['error']}[/red]" if res.get("error") else ""))
     wall = time.time() - t0
     cands = score_candidates(results, cfg)
+    target = str(meta.get("target") or header.source_name)
+    if ledger is not None and not cands.empty:
+        from .rfi import flag_multi_target
+        cands = flag_multi_target(cands, ledger.signals, target)
     title = f"AI-SETI search of {meta.get('target') or Path(str(location)).name}"
     stats = write_outputs(results, cands, outdir, cfg, title,
                           {"location": str(location), "observation": meta,
-                           "header": header.to_dict()}, wall)
+                           "header": header.to_dict(), "drift_resolvable": resolvable}, wall)
     if ledger is not None:
         for r in results:
             ledger.record_unit(r)
+        if not cands.empty:
+            ledger.remember_signals(cands["frequency_mhz"], target)
         if not cands.empty and ledger.record_best({**cands.iloc[0].to_dict(),
                                                    "location": str(location)}):
             print("[bold #ffcc33]New lifetime best signal![/bold #ffcc33]")
@@ -173,7 +185,8 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
            watch_dir: Path = typer.Option(Path("data/raw"), help="Directory for --source local."),
            forever: bool = typer.Option(False, help="Keep polling for new data like a BOINC client."),
            poll_seconds: int = typer.Option(600),
-           max_units: int = typer.Option(0, help="Crunch only the first N units per observation."),
+           max_units: int = typer.Option(0, help="Crunch at most N units per observation per "
+                                         "run; the next run continues where this one stopped."),
            outdir: Path = typer.Option(Path("reports/crunch")),
            state: Path = typer.Option(Path("data/state.json")),
            workers: int = typer.Option(None), snr: float = typer.Option(None),
@@ -183,7 +196,7 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
            config: Path = CONFIG_OPT):
     """Auto-load new data and crunch it continuously, SETI@home style."""
     from .sources import BreakthroughListenSource, LocalSource, SetiAtHomeSource, SyntheticSource
-    from .state import Ledger
+    from .state import MAX_ATTEMPTS, Ledger
     cfg = _cfg(config, workers, snr)
     ledger = Ledger.load(state)
 
@@ -207,24 +220,39 @@ def crunch(source: str = typer.Option("auto", help="auto | bl | local | syntheti
         raise typer.BadParameter(f"Unknown source {source}")
 
     while True:
-        n_new = 0
-        for location, kind, header, meta in src.observations(set(ledger.observations_done)):
+        n_new = n_failed = 0
+        for location, kind, header, meta in src.observations(ledger.skip()):
             if kind == "error":
+                n_failed += 1
+                ledger.fail(str(meta.get("url")), str(meta.get("error")))
+                ledger.save()
                 print(f"[red]skip[/red] {meta.get('url')}: {meta.get('error')}")
                 continue
             n_new += 1
             stem = Path(str(location).split("?")[0]).stem
             print(f"\n[bold #36c2b4]New work:[/bold #36c2b4] {meta.get('target')}  {stem}  "
                   f"({header.f_min:.3f}–{header.f_max:.3f} MHz, {header.nchans:,} ch)")
-            rng = (0, min(header.nchans, max_units * cfg.channels_per_unit)) if max_units else None
-            cands, stats = crunch_observation(location, kind, header, meta, cfg,
-                                              outdir / stem, live, ledger, chan_range=rng)
-            _summary(cands, stats, outdir / stem, n=5)
+            key = str(meta.get("url") or location)
+            rng = ledger.next_range(key, header.nchans, max_units * cfg.channels_per_unit)
+            partial = rng != (0, header.nchans)
+            report_dir = outdir / (f"{stem}_ch{rng[0]}-{rng[1]}" if partial else stem)
+            if partial:
+                print(f"Channels {rng[0]:,}–{rng[1]:,} of {header.nchans:,}")
+            cands, stats = crunch_observation(location, kind, header, meta, cfg, report_dir,
+                                              live, ledger, chan_range=rng)
+            _summary(cands, stats, report_dir, n=5)
             if auto_share and not cands.empty:
-                _share_run(outdir / stem, cfg, cfg.share_to, ledger, cfg.share_top,
+                _share_run(report_dir, cfg, cfg.share_to, ledger, cfg.share_top,
                            cfg.share_min_interest, None, True, False, cfg.share_require_cadence)
-            ledger.done(str(meta.get("url") or location))
+            if stats.get("errors"):
+                # Don't mark channels searched that weren't: retry this range next run.
+                ledger.fail(key, f"{stats['errors']} work unit(s) failed")
+            else:
+                ledger.advance(key, rng[1], header.nchans)
             ledger.save()
+        gave_up = sum(v["attempts"] >= MAX_ATTEMPTS for v in ledger.failed.values())
+        print(f"{n_new} crunched, {n_failed} failed this pass; {gave_up} file(s) skipped after "
+              f"{MAX_ATTEMPTS} failed attempts (see 'failed' in {state}).")
         if not forever:
             if n_new == 0:
                 print("No new observations matched. Try another --target or --source.")
@@ -264,7 +292,7 @@ def cadence(files: list[Path], outdir: Path = typer.Option(Path("reports/cadence
 
 def _share_run(report_dir: Path, cfg: SearchConfig, destinations: list[str], ledger,
                top: int, min_interest: float, cadence_events: Path | None, send: bool,
-               allow_synthetic: bool, require_cadence: bool):
+               allow_synthetic: bool, require_cadence: bool | None):
     from .share import build_findings, passes_gate, share
     recs = build_findings(report_dir, top, min_interest, cfg.reporter_handle, cadence_events)
     if not recs:
@@ -273,14 +301,15 @@ def _share_run(report_dir: Path, cfg: SearchConfig, destinations: list[str], led
     t = Table(title="Findings ready to share")
     for col in ("ID", "MHz", "Hz/s", "SNR", "interest", "cadence", "gate"):
         t.add_column(col)
+    remote = [d for d in destinations if d != "bundle"]
+    gate_cadence = bool(remote) if require_cadence is None else require_cadence
     for r in recs:
-        ok, why = passes_gate(r, require_cadence)
+        ok, why = passes_gate(r, gate_cadence)
         t.add_row(r["finding_id"], f"{r['signal']['frequency_mhz']:.6f}",
                   f"{r['signal']['drift_rate_hz_s']:+.3f}", f"{r['signal']['snr']:.1f}",
                   f"{r['assessment']['interest']:.0f}", r["assessment"]["cadence"],
                   "[green]ok[/green]" if ok else f"[yellow]{why}[/yellow]")
     console.print(t)
-    remote = [d for d in destinations if d != "bundle"]
     if remote and not send:
         print(f"[yellow]Preview only: not sent to {', '.join(remote)}. Add --yes to send.[/yellow]")
         destinations = [d for d in destinations if d == "bundle"]
