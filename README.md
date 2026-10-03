@@ -340,6 +340,32 @@ should not look like a clean one. The usual cause is a scikit-learn version outs
 `>=1.8,<1.9` window the bundled model was pickled with — see
 [Install](#install) and `ai-seti train`.
 
+## One report for everything you have run
+
+Each run keeps its own folder. `ai-seti summary` collects them all into one page:
+
+```bash
+ai-seti summary                 # scans reports/, writes reports/summary.html + summary.csv
+ai-seti summary --root reports/crunch --outdir reports/
+```
+
+The overview shows the best signal across every run, the totals (runs, channels, hits,
+spikes, pulses, CPU and wall hours), and one sortable row per run. Clicking a run name
+opens that run's own `report.html`, so the overview is an index, never a replacement.
+
+It also states, before you read any of it, which runs should not be trusted at face value —
+runs with failed work units, runs whose AI layer was inactive, runs that searched a narrower
+drift range than their own config asked for, and runs whose top candidate is flagged as a
+coarse-channel mirror image or as also appearing in another target.
+
+The same overview is in the web UI, which binds to `http://127.0.0.1:8061` per
+[RULES_ports.md](RULES_ports.md); pick **Past runs (overview)** in the sidebar.
+
+| | |
+|---|---|
+| `reports/summary.html` | Self-contained overview page, sortable, links to each run |
+| `reports/summary.csv` | The same numbers, one row per run plus a totals row, for spreadsheets |
+
 ## Quick start
 
 ```bash

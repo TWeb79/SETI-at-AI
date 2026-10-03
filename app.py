@@ -9,6 +9,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -27,12 +28,74 @@ from ai_seti.sources import (
     split,
     unit_too_large,
 )
+from ai_seti.summary import best_overall, warnings_for
 
 if __name__ == "__main__" and not st.runtime.exists():
     sys.exit("This is a Streamlit app. Start it with:  streamlit run app.py")
 
-MODES = ["Synthetic demo", "Breakthrough Listen archive", "Remote file URL",
-         "Local filterbank (.fil / .h5)"]
+MODES = ["Past runs (overview)", "Synthetic demo", "Breakthrough Listen archive",
+         "Remote file URL", "Local filterbank (.fil / .h5)"]
+
+
+@st.cache_data(show_spinner="Collecting run reports…")
+def _overview(root: str):
+    """Every finished run under `root`, newest totals first. Cached per reports-tree state."""
+    from ai_seti.summary import collect
+    return collect(Path(root))
+
+
+def _show_overview(root: str) -> None:
+    """Cross-run overview: the same numbers `ai-seti summary` writes to summary.html."""
+    df = _overview(root)
+    runs = df.iloc[:-1] if len(df) else df
+    if runs.empty:
+        st.info(f"No completed runs found under `{root}`. Run `ai-seti demo` or "
+                "`ai-seti analyze <file>` first.")
+        return
+    totals = df.iloc[-1]
+    st.subheader(f"{len(runs)} run(s) under `{root}`")
+    c = st.columns(6)
+    c[0].metric("Runs", f"{len(runs)}")
+    c[1].metric("Channels", f"{int(totals['channels']):,}" if pd.notna(totals["channels"]) else "–")
+    c[2].metric("Hits", f"{int(totals['hits']):,}" if pd.notna(totals["hits"]) else "–")
+    c[3].metric("CPU hours", f"{float(totals['cpu_hours']):.2f}"
+                if pd.notna(totals["cpu_hours"]) else "–")
+    c[4].metric("Wall hours", f"{float(totals['wall_hours']):.2f}"
+                if pd.notna(totals["wall_hours"]) else "–")
+    c[5].metric("Best interest", f"{float(totals['best_interest']):.1f}"
+                if pd.notna(totals["best_interest"]) else "–")
+
+    for w in warnings_for(df):
+        st.warning(w, icon="⚠")
+
+    show = runs.copy()
+    show["flags"] = [
+        ", ".join(filter(None, [
+            "mirror image" if m else "", "multi-target" if t else "",
+            "drift degraded" if d else "", "AI inactive" if n else "",
+        ])) for m, t, d, n in zip(show["best_mirror_image"], show["best_multi_target"],
+                                  show["drift_degraded"], show["ai_note"].fillna("") != "",
+                                  strict=True)]
+    show["run"] = show["run"].astype(str).str.slice(0, 46)
+    st.dataframe(
+        show[["target", "run", "hits", "best_interest", "best_frequency_mhz", "best_drift_hz_s",
+              "best_snr", "best_ai_class", "flags", "wall_seconds", "channels_per_second"]]
+        .sort_values("best_interest", ascending=False)
+        .rename(columns={
+            "target": "Target", "run": "Run", "hits": "Hits", "best_interest": "Interest",
+            "best_frequency_mhz": "Freq (MHz)", "best_drift_hz_s": "Drift (Hz/s)",
+            "best_snr": "SNR", "best_ai_class": "AI class", "flags": "Flags",
+            "wall_seconds": "Wall s", "channels_per_second": "ch/s"}),
+        hide_index=True, width="stretch")
+
+    best = best_overall(df)
+    if best:
+        st.success(f"Best across all runs: **{best['best_interest']:.1f}** interest at "
+                   f"`{best['best_frequency_mhz']:.6f} MHz` from `{best['run']}` "
+                   f"(classified {best['best_ai_class']}).")
+    st.caption("Write this overview to a shareable file with `ai-seti summary` "
+               "(`summary.html` + `summary.csv`). Candidates are unverified statistical "
+               "detections, not technosignature claims.")
 
 
 @st.cache_resource
@@ -62,6 +125,14 @@ st.caption(f"AI-SETI {__version__} · started {_started()} · Candidates are unv
 
 mode = st.sidebar.radio("Input", MODES)
 cfg = SearchConfig()
+
+if mode == "Past runs (overview)":
+    # Read-only index over reports that already exist; it never runs a search.
+    root = st.sidebar.text_input("Reports tree", "reports")
+    st.sidebar.button("Refresh", on_click=_overview.clear)
+    _show_overview(root)
+    st.stop()
+
 cfg.snr_threshold = st.sidebar.slider("De-Doppler SNR threshold", 6.0, 25.0, 10.0, 0.5)
 cfg.max_drift_rate_hz_s = st.sidebar.slider("Max drift (Hz/s)", 0.5, 10.0, 4.0, 0.5)
 cfg.workers = st.sidebar.number_input("Workers (0 = all cores)", 0, 256, 0)

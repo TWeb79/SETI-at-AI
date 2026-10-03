@@ -652,5 +652,66 @@ def benchmark(trials: int = typer.Option(20), out: Path = typer.Option(Path("rep
     print(f"Seconds per {res['chunk']} chunk: {res['seconds_per_chunk']}")
 
 
+@app.command()
+def summary(root: Path = typer.Option(Path("reports"), help="Reports tree to summarise."),
+            outdir: Path = typer.Option(None, help="Where to write; defaults to <root>."),
+            top: int = typer.Option(10, help="Rows to print to the terminal.")):
+    """Combine every existing run report under a tree into one overview page.
+
+    Reads what previous runs already wrote; it never re-runs a search and never changes
+    how an individual run reports itself.
+    """
+    import pandas as pd
+
+    from .summary import best_overall, warnings_for, write_summary
+
+    root = Path(root)
+    out = Path(outdir) if outdir else root
+    if not root.is_dir():
+        raise typer.BadParameter(f"No such reports directory: {root}")
+    html, df = write_summary(root, out)
+    runs = df.iloc[:-1] if len(df) else df
+    if runs.empty:
+        console.print(f"[yellow]No completed runs found under[/yellow] {root}")
+        return
+
+    best = best_overall(df)
+    t = Table(title=f"AI-SETI overview of {len(runs)} run(s) under {root}")
+    t.add_column("target")
+    t.add_column("hits", justify="right")
+    t.add_column("best interest", justify="right")
+    t.add_column("best MHz")
+    t.add_column("AI class")
+    t.add_column("flags", overflow="fold")
+
+    def shown(value, spec: str) -> str:
+        """Format a possibly-missing number. NaN is truthy, so test it explicitly."""
+        return spec.format(value) if pd.notna(value) else "–"
+
+    for _, r in runs.nlargest(top, "best_interest").iterrows():
+        flags = []
+        if bool(r.get("best_mirror_image")):
+            flags.append("mirror image")
+        if bool(r.get("best_multi_target")):
+            flags.append("multi-target")
+        if bool(r.get("drift_degraded")):
+            flags.append("drift degraded")
+        if r.get("ai_note"):
+            flags.append("AI inactive")
+        if pd.notna(r.get("errors")) and r["errors"] > 0:
+            flags.append(f"{int(r['errors'])} failed unit(s)")
+        t.add_row(str(r.get("target") or "–"), shown(r.get("hits"), "{:.0f}"),
+                  shown(r.get("best_interest"), "{:.1f}"),
+                  shown(r.get("best_frequency_mhz"), "{:.4f}"),
+                  str(r.get("best_ai_class") or "–"), ", ".join(flags) or "–")
+    console.print(t)
+    for w in warnings_for(df):
+        console.print(f"[gold]![/gold] {w}")
+    if best:
+        console.print(f"\nBest across all runs: [bold]{best['best_interest']:.1f}[/bold] interest "
+                      f"at {best['best_frequency_mhz']:.6f} MHz ({best['run']})")
+    console.print(f"\nOverview: [bold]{html}[/bold]\nData:    {out / 'summary.csv'}")
+
+
 if __name__ == "__main__":
     app()
