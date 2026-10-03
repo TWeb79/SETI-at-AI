@@ -50,6 +50,102 @@ CI (`.github/workflows/ci.yml`) runs lint, typecheck and tests on Python 3.11, 3
 classifier loads, `demo` produces a report with real AI classes, and `share` writes a
 bundle.
 
+## How to use this
+
+Three steps: install it, point it at some data, read the report. You can stop after any of
+them, and nothing is sent anywhere unless you explicitly ask for it.
+
+### 1. Try it on data it makes up
+
+```bash
+ai-seti demo
+```
+
+This builds a fake radio observation — a GBT-like coarse channel with **3 signals hidden in
+it** plus 60 pieces of interference — searches it, and writes a report. The three hidden
+signals should come back ranked #1, #2 and #3, all labelled `technosignature_like`. Nothing
+is downloaded and nothing leaves the machine.
+
+### 2. Point it at real data
+
+Pick whichever fits:
+
+```bash
+ai-seti analyze data/raw/obs.fil                        # a file already on disk
+ai-seti analyze https://example.org/obs.0000.fil        # a URL, streamed not downloaded
+ai-seti crunch --target HIP --max-units 8               # fetch new BL observations, keep going
+```
+
+`analyze` searches one file, once. `crunch` is the SETI@home-style loop: it asks the
+Breakthrough Listen archive for work, processes everything it has not seen, and remembers
+what it already did in `data/state.json`.
+
+Before hunting for aliens, it is worth checking the file you have is sane:
+
+```bash
+ai-seti inspect data/raw/obs.fil    # header only: size, sample rate, channel width, source
+```
+
+### 3. Read the report
+
+Each run writes a folder — `reports/analysis` or `reports/crunch` by default:
+
+| File | What it is |
+|---|---|
+| `report.html` | **Start here.** Animated 3-D power plot plus the ranked candidate table. |
+| `candidates.csv` | Every hit, one row per signal, ranked by interest score. |
+| `spikes.csv`, `pulses.csv` | Single-sample spikes and dispersed pulses. |
+| `band_overview.png` | Where in the band the power sits. |
+| `metadata.json` | Config, package versions and timings for this run. |
+
+The single number that ranks candidates is **interest**, 0–100. It blends how ET-like the
+signal looks, its SNR, and how unusual it is against every other hit in the same run.
+
+## The AI part: running with or without it
+
+The AI is one optional layer on top of the search. A classifier looks at each hit and
+labels it — `technosignature_like`, `rfi_zero_drift`, `rfi_intermittent`, and so on — and
+feeds a 0–1 "this looks like a technosignature" probability into the interest score.
+
+### With AI (the default)
+
+The bundled `hit_classifier.joblib` scores every hit. You get an `ai_class` label per row
+and per-class probabilities as `p_*` columns in `candidates.csv`. The demo's #1–#3 ranking
+depends on this.
+
+### Without AI
+
+Set `"use_ai": false` in a config file and pass it with `--config`:
+
+```bash
+echo '{"use_ai": false}' > no-ai.json
+ai-seti analyze data/raw/obs.fil --config no-ai.json
+```
+
+The search itself is untouched — same detections, same SNRs, same spikes and pulses. Only
+the labelling and the ranking change:
+
+| | AI on | AI off |
+|---|---|---|
+| `ai_class` | `technosignature_like`, `rfi_*`, … | `ai_disabled` on every row |
+| `p_*` probability columns | present | absent |
+| interest score | uses the classifier probability, a soft 0–1 value | uses a fixed rule: narrow, drifting and steady scores 0.7, everything else 0.0 |
+
+On one demo file, the top candidate scored **81.5 with AI and 70.3 without** — and the
+ranking itself changes, because the fallback rule can only award 0.7 or 0. It cannot put a
+faint signal above a strong one the way a real probability can.
+
+You might turn it off to check whether the classifier is flattering your results, to see
+what the raw detector finds on its own, or to save a little time on a slow machine.
+
+### If the AI is on but the model will not load
+
+You get `ai_class = model_unavailable` and a warning banner in `report.html`, never a
+silent `unscored`. That distinction is the point: a run that fell back to the heuristic
+should not look like a clean one. The usual cause is a scikit-learn version outside the
+`>=1.8,<1.9` window the bundled model was pickled with — see
+[Install](#install) and `ai-seti train`.
+
 ## Quick start
 
 ```bash
