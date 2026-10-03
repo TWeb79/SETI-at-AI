@@ -6,8 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One group per pull request, else per commit: a PR's new push cancels its outdated run, but
+# nothing on main is cancelled, least of all by re-running an old run (backlog B45).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:

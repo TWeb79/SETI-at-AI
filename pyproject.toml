@@ -29,7 +29,8 @@ gpu = ["cupy-cuda12x>=13"]                   # experimental, NVIDIA only
 compare = ["turbo_seti>=2.3", "blimpy>=2.1"] # cross-check against the reference pipeline
 dashboard = ["streamlit>=1.35"]
 notebook = ["jupyterlab>=4", "ipykernel>=6"]
-dev = ["pytest>=8", "ruff>=0.5", "mypy>=1.10"]
+# Linters pinned: an unpinned ruff/mypy can turn CI red with no code change (B45). Bump on purpose.
+dev = ["pytest>=8", "ruff==0.16.10", "mypy==2.4.0"]
 
 [project.scripts]
 ai-seti = "ai_seti.cli:app"

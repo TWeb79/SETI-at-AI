@@ -5,7 +5,7 @@ Author: Inventions4All — github:TWeb79
 Applies to: **v0.3.0**. Opened at the end of the 0.3.0 hardening pass
 (see [implementationplan.md](implementationplan.md)).
 
-Fixed items are removed from this file once done. As of 2026-10-03 everything from B1 to B44 is
+Fixed items are removed from this file once done. As of 2026-10-03 everything from B1 to B45 is
 fixed, or closed with a measured reason (B10, B40). The write-ups, the real-data runs of
 2026-10-03 and the regression tests that pin them are in git history; the performance
 measurements are kept below because they still describe how `crunch` spends its time.

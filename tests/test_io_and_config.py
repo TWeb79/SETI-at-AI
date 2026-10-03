@@ -180,3 +180,14 @@ def test_web_ui_port_and_bind_address():
     assert cfg["server"]["port"] == 8061
     assert cfg["server"]["address"] == "127.0.0.1"
     assert "DASHBOARD_PORT=8061" in (PROJECT_ROOT / "ports.env").read_text()
+
+
+def test_ci_cannot_be_cancelled_by_rerunning_an_old_run_and_linters_are_pinned():
+    """B45: a re-run of an old run cancelled CI for the latest commit on main."""
+    import tomllib
+
+    ci = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert "group: ci-${{ github.event.pull_request.number || github.sha }}" in ci
+    dev = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())[
+        "project"]["optional-dependencies"]["dev"]
+    assert any(d.startswith("ruff==") for d in dev) and any(d.startswith("mypy==") for d in dev)
