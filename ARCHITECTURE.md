@@ -4,6 +4,8 @@ Parallel, AI-assisted radio technosignature search in the spirit of SETI@home.
 This document describes how a work unit becomes a ranked candidate, where each
 responsibility lives, and which boundaries the design deliberately enforces.
 
+Known defects and deferred work are tracked in [backlog.md](backlog.md).
+
 ## System shape
 
 ```
@@ -110,6 +112,7 @@ AI-SETI is a local CLI. There is no server, no database and no always-on daemon.
 | Server ignores `Range` | `RangeNotSupported` → the source falls back to a size-guarded download |
 | Classifier will not load | logged, `model_unavailable`, heuristic fallback, `ai_note` in metadata |
 | Ledger write | unique per-PID temp file then `os.replace`, so a partial file is never published |
+| Searched drift range collapses to zero | **not handled.** `drift_search` clamps `k_max` silently, so an unsearchable drift rate yields "no hits" rather than a degraded run. See [backlog.md](backlog.md) B1/B2. |
 
 ## External dependencies
 
@@ -122,6 +125,7 @@ Optional: `h5py` + `hdf5plugin` (`.h5`), `streamlit` (dashboard), `cupy` (experi
 
 - **Python 3.11–3.13 only**, per `requires-python`. No support for 3.14 yet.
 - **The bundled model pins scikit-learn to `<1.9`.** A pickled estimator is not portable
-  across minor versions; the upper bound and `tests/test_model.py` keep this honest.
+  across minor versions; the upper bound and `tests/test_model_and_limits.py` keep this
+  honest.
 - **GPU (CuPy) path is experimental and untested**, and is excluded from CI. The array-API
   style in `dsp/dedoppler.py` exists so it can work, not because it is verified.

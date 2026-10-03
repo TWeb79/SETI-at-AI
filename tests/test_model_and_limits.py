@@ -139,6 +139,35 @@ def test_drift_cap_limits_searched_paths():
         "a 4 ch/step cap must exclude an 8 ch/step tone"
 
 
+def test_drift_search_recovers_a_tone_at_gbt_coarse_resolution():
+    """The search must work at the real channel width, not just the narrow test grids.
+
+    Every other drift test uses a synthetic 16384-channel block at an invented resolution.
+    Production is a GBT coarse channel: 2.794 Hz channels sampled every 18.25 s, where the
+    4 Hz/s ceiling is already ~26 channels per step. This pins that regime end to end, and
+    pins the `foff_mhz` unit convention -- `drift_search` multiplies by 1e6 internally, so a
+    channel width quoted in Hz must be passed as 2.7939677238464355e-06, not 2.794. Passing
+    the Hz value silently collapses the searchable drift to zero and the search reports
+    nothing at all (backlog B1/B2).
+    """
+    foff_mhz = 2.7939677238464355e-06  # 2.794 Hz, expressed in MHz as drift_search expects
+    rng = np.random.default_rng(11)
+    n_chan = 32768
+    data = noise_waterfall(16, n_chan, rng, fine_per_coarse=n_chan)
+    inject(data, Injection("technosignature_like", 8000.0, 13.0, 6.0, 1.0), rng)
+    z = normalize(data, block=512, fine_per_coarse=n_chan)
+
+    hits, snr = drift_search(z, tsamp=18.253611008, foff_mhz=foff_mhz, max_drift_hz_s=4.0,
+                             max_ch_per_step=32, snr_threshold=10.0, max_hits=50)
+
+    best = max(hits, key=lambda h: h.snr)
+    assert abs(best.start_channel - 8000) <= 2, "start channel must be located, not approximated"
+    assert abs(best.drift_ch_per_step - 13.0) <= 0.5, \
+        "a 13 ch/step tone must be labelled 13 ch/step, not smeared to a neighbour"
+    assert best.snr > 10.0, "the recovered SNR must clear the threshold it was found at"
+    assert float(snr[8000]) > 10.0, "the SNR map must carry the detection for the dashboard"
+
+
 def test_drift_ceil_respects_configured_cap():
     cfg = SearchConfig(max_drift_rate_hz_s=4.0, max_drift_ch_per_step=4)
     hdr = _header()

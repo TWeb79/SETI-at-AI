@@ -44,8 +44,7 @@ def test_h5_header_roundtrip(tmp_path):
     assert hdr.nbits == 32 and hdr.tstart == 59000.5
     assert hdr.nifs == 1
     assert hdr.frequencies(0, 2)[0] == pytest.approx(1420.0)
-    assert "data size" not in json.dumps(hdr.to_dict()) or True   # to_dict stays JSON-safe
-    json.dumps(hdr.to_dict())                                     # must not raise
+    json.dumps(hdr.to_dict())  # must not raise: header metadata is serialised verbatim
 
 
 def test_h5_window_read_matches_source(tmp_path):
@@ -81,9 +80,9 @@ def test_h5_data_reaches_the_pipeline(tmp_path):
     from ai_seti.sources import split
 
     rng = np.random.default_rng(4)
-    data = normalize_like = noise_waterfall(16, 16384, rng)
+    data = noise_waterfall(16, 16384, rng)
     inject(data, Injection("technosignature_like", 8000.0, 2.0, 6.0, 1.0), rng)
-    assert normalize_like.shape == (16, 16384)
+    assert data.shape == (16, 16384)
     p = tmp_path / "obs.h5"
     _write_h5(p, data)
 

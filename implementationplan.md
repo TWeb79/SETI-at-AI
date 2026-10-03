@@ -30,6 +30,11 @@ quality gates enforceable.
 | 18 | Correct stale README claims | `README.md` | done |
 | 19 | Close the coverage gaps the review exposed: `dsp/detectors.py` 28%, `benchmark.py` 0%, `io/filterbank.py` 69%, `state.py` 51% | `tests/` | done |
 | 20 | Fix `channel_range` returning an inverted range for out-of-band requests | `io/filterbank.py` | done |
+| 21 | Backlog the defects found after the pass and link it from the docs | `backlog.md` | done |
+| 22 | Regression test: drift search at real GBT coarse-channel resolution | `tests/test_model_and_limits.py` | done |
+| 23 | Fix the stale `tests/test_model.py` path cited in the architecture notes | `ARCHITECTURE.md` | done |
+| 24 | Record the unhandled drift-range collapse in the failure-handling table | `ARCHITECTURE.md` | done |
+| 25 | State the drift-search and classifier-drift limitations in the README | `README.md` | done |
 
 ## Test plan
 
@@ -65,10 +70,15 @@ One-liner per task, mapping to the test that would fail if the task were reverte
     that v0.2 beats v0.1 on a drifting tone.
 11. **Regression suite.** All 15 pre-existing tests still pass, including
     `test_pipeline_finds_injected_signal_once`, whose drift expectations the cap still satisfies.
+12. **Task 22 — production resolution.** `test_drift_search_recovers_a_tone_at_gbt_coarse_resolution`
+    builds a 32768-channel coarse channel at 2.794 Hz / 18.25 s, injects a 13 ch/step tone and
+    asserts the start channel, drift and SNR are all recovered. Every other drift test uses a
+    narrower synthetic grid, so none of them would have caught a wrong-unit `foff` collapsing
+    the searchable drift to zero — the failure mode recorded as backlog B1/B2.
 
 ## Verification performed
 
-- `pytest` — 66 tests, all green.
+- `pytest` — 67 tests, all green.
 - `pytest --cov=ai_seti` — **65%** (was 50%). `dsp/detectors.py` 28%→98%, `benchmark.py`
   0%→94%, `io/filterbank.py` 69%→91%, `config.py` 77%→100%, `report.py` 0%→85%,
   `state.py` 51%→93%, `rfi.py` 95%, `share.py` 93%, `pipeline.py` 88%.
@@ -84,3 +94,21 @@ tones at ranks **#1, #2 and #3**, all classified `technosignature_like`, ahead o
 strongest RFI (interest 74–82 vs 28–32). Before the fix the same run reported `unscored`
 for every candidate and the README's "#1–#3" claim was false — the AI layer was doing
 nothing. Single-core demo time is 2.4 s wall / 2.3 s CPU.
+
+## Deferred — see [backlog.md](backlog.md)
+
+This pass did not close everything it found. Three defects are documented and left open
+rather than fixed, because each needs a decision about intended behaviour, not just a patch:
+
+- **B1** — `drift_search` clamps the searchable drift range silently. An unsearchable drift
+  rate produces "no hits" rather than a degraded run, which is the wrong failure shape for a
+  null-result instrument.
+- **B2** — `foff_mhz` is unvalidated, so a channel width in Hz passed as MHz quietly blinds
+  the search. This was hit for real during this pass and cost ~30 minutes of misdiagnosis.
+- **B3** — the classifier trains on 0.05–6 channels/step but must score up to ~26 in
+  production. Fixing it means regenerating and re-measuring the model, which is a separate
+  piece of work.
+
+Two module gaps are also recorded as test debt: `cli.py` and `dashboard.py` are at 0% and
+are currently covered only by the CI smoke job, which makes the headline 65% coverage flatter
+than it looks. The floor should not be raised until one of them has real tests.

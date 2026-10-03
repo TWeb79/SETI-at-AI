@@ -7,8 +7,9 @@ planet would, and keeps a running tally of the best signal it has ever found.
 > Candidates are statistical detections. A real technosignature claim needs an ON/OFF
 > cadence pass, independent re-observation and a lot of humility.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for module responsibilities and data flow, and
-[implementationplan.md](implementationplan.md) for the change log.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module responsibilities and data flow,
+[implementationplan.md](implementationplan.md) for the change log, and
+[backlog.md](backlog.md) for known defects and deferred work.
 
 ## Data: where the work comes from
 
@@ -38,7 +39,7 @@ blimpy/turboSETI are no longer required (optional `[compare]` extra for cross-ch
 ## Development and quality gates
 
 ```bash
-pytest                                   # 66 tests
+pytest                                   # 67 tests
 pytest --cov=ai_seti --cov-report=term-missing
 ruff check .                             # lint
 mypy                                     # typecheck (configured in pyproject.toml)
@@ -111,7 +112,7 @@ directly rather than post publicly.
 | Whole selection loaded via blimpy, single core. | Memory-mapped SIGPROC / chunked HDF5 reader; overlapping work units; process pool (1 BLAS thread per worker); HTTP Range streaming. |
 | No RFI handling, no AI. | Known-band flags, zero-drift penalty, ON/OFF cadence filter; gradient-boosted hit classifier + isolation-forest anomaly score → 0–100 interest score. |
 | Only one signal type. | + SETI@home-style spikes, + Astropulse-style dispersed pulses (for high-time-resolution products). |
-| Test fixture crashed for < 701 channels. | Fixed; 66 tests incl. a local Range-server streaming test and mocked GitHub/webhook sharing. |
+| Test fixture crashed for < 701 channels. | Fixed; 67 tests incl. a local Range-server streaming test, mocked GitHub/webhook sharing, and a drift search at real GBT coarse-channel resolution. |
 
 ## Review of v0.3 — what changed
 
@@ -168,6 +169,15 @@ run level: isolation-forest anomaly → RFI flags → interest score → report
 - `max_drift_ch_per_step` (default 32) bounds the search. At a GBT coarse channel's
   ~18 s / 2.79 Hz resolution, 4 Hz/s is already ~26 channels per step, so lowering this
   below that number silently throws away signals the rate limit allows.
+- **`drift_search` will not tell you when it could not search the range you asked for.** If
+  the searched drift clamps to zero — a `foff` passed in Hz instead of MHz, a cap below the
+  rate, or a resolution too coarse for the requested drift — it reports *no hits* instead of
+  flagging a degraded run. Absence of detections is not evidence of absence until you have
+  checked the range was searchable. Tracked as [backlog B1/B2](backlog.md).
+- **The classifier is trained on drift of 0.05–6 channels/step but production needs up to
+  ~26.** Its class labels are least reliable in the fast-drift regime the search spends most
+  of its time in, and the published 95.7% accuracy is measured on the training distribution,
+  not on production drift. Tracked as [backlog B3](backlog.md).
 - BL archive API and Range streaming against the real servers were not tested from the
   development sandbox (network-restricted); Range streaming is tested locally.
 - GPU (CuPy) path is experimental and untested, and excluded from CI. Multi-core speedup
