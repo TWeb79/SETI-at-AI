@@ -385,6 +385,8 @@ ai-seti analyze http://…/obs.0000.fil
 ai-seti cadence A.fil B_OFF.fil A2.fil C_OFF.fil A3.fil D_OFF.fil
 # v0.1 vs v0.2 injection/recovery
 ai-seti benchmark
+# one overview page over every run under reports/
+ai-seti summary
 # retrain the hit classifier (~1 min, CPU)
 ai-seti train
 # web UI at http://127.0.0.1:8061 (port and localhost-only bind: .streamlit/config.toml)

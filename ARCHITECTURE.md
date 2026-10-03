@@ -56,6 +56,7 @@ Data sources:
 | `rfi.py` | Known-band flags; ON/OFF cadence filter | score interest |
 | `pipeline.py` | `process_work_unit` (worker side); `run_units` (pool); `score_candidates` (run side) | write files |
 | `report.py` | CSV/JSON/PNG/HTML output; version + build stamp | re-run detection |
+| `summary.py` / `summary_html.py` | Cross-run index: read every run's `metadata.json` + `candidates.csv` into one `summary.html` / `summary.csv` | change how a run reports itself |
 | `share.py` | `ai-seti-finding/1` records, gate, dedupe ledger, bundle/github/webhook sinks | bypass the gate |
 | `state.py` | `Ledger`: resume, lifetime stats, best-ever signal, share dedupe | store observations |
 | `dashboard.py` / `app.py` | Terminal live view; Streamlit front end | alter results |
@@ -102,6 +103,10 @@ AI-SETI is a local CLI. There is no server, no database and no always-on daemon.
   it is never allowed to look like a clean run.
 - **Core ↔ network.** Only `io/remote.py` and `sources.py` open sockets. Tests exercise the
   Range path against a local HTTP server, so no test needs the internet.
+- **Per-run ↔ cross-run.** `report.write_outputs` is the only writer of a run folder.
+  `summary.py` is strictly a reader: it discovers folders by their `metadata.json`, and a
+  summary pass never opens a run's `candidates.csv` for writing. A regression test hashes
+  every file in a run folder before and after a summary to keep that boundary honest.
 
 ## Failure handling
 
