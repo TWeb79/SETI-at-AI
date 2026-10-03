@@ -1,9 +1,11 @@
 import http.server
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ai_seti.ai.simulate import Injection, inject, noise_waterfall
 from ai_seti.config import SearchConfig
@@ -117,6 +119,50 @@ def test_remote_range_streaming(tmp_path):
         assert np.allclose(remote_window(url, hdr, 1000, 1300), d[:, 1000:1300])
     finally:
         srv.shutdown()
+
+
+class _EmptyRangeHandler(http.server.BaseHTTPRequestHandler):
+    """Answers every Range request with a well-formed but empty 206.
+
+    This is what a truncating proxy or a half-open link looks like to the client: the status
+    line and `Content-Range` are correct, and the body is simply absent.
+    """
+
+    def do_GET(self):
+        type(self).requests += 1
+        self.send_response(206)
+        self.send_header("Content-Range", "bytes 0-16383/1073741824")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+def test_remote_header_gives_up_when_the_server_stops_sending():
+    """An empty 206 must terminate the header read (backlog B4).
+
+    Before the fix the buffer never grew, so the `len(buf) > 1 << 20` escape was unreachable
+    and the identical Range was re-requested forever — measured at 10,798 requests in 5 s
+    against a local server. Against the real Breakthrough Listen archive that is an
+    unthrottled request flood from every volunteer whose connection hiccups.
+    """
+    from ai_seti.io.remote import remote_header
+
+    handler = type("Counting", (_EmptyRangeHandler,), {"requests": 0})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}/obs.fil"
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="No SIGPROC header"):
+            remote_header(url, max_requests=8)
+        elapsed = time.monotonic() - started
+    finally:
+        srv.shutdown()
+    assert elapsed < 1.0, "must fail fast instead of retrying indefinitely"
+    assert handler.requests <= 2, \
+        f"at most one wasted request was needed, saw {handler.requests}"
 
 
 def test_cadence_filter_keeps_on_only_signal():

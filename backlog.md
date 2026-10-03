@@ -15,18 +15,16 @@ must not be renumbered** — other documents and the tables below cross-referenc
 Severity: **high** = can produce a wrong or misleading result · **med** = wrong behaviour in
 a plausible configuration · **low** = quality, debt or hygiene.
 
----
-
 ## Triage
 
 | ID | Severity | Summary | Area |
 |---|---|---|---|
-| B4 | high | `remote_header` loops forever on an empty Range response — floods the server | `io/remote.py` |
-| B9 | high | Drifts far beyond the configured limit are searched and reported | `dsp/dedoppler.py` |
+| ~~B4~~ | high — **fixed** | ~~`remote_header` looped forever on an empty 206~~ | `io/remote.py` |
 | B6 | high | Coarse-channel mirror images rank as top `technosignature_like` candidates | new pipeline stage |
 | B8 | high | Classifier saturates at p=1.0 at any SNR — publishes RFI as a technosignature | `ai/model.py` |
 | B7 | high | The same signal in several targets is not recognised as interference | `sources.py`, `state.py` |
 | B5 | high | `--max-units` takes the top of the band, then marks the whole file done | `cli.py`, `state.py` |
+| ~~B9~~ | high — **fixed** | ~~Drifts far beyond the configured limit were searched and reported~~ | `dsp/dedoppler.py` |
 | B1 | high | `drift_search` silently degenerates to a zero-drift-only search | `dsp/dedoppler.py` |
 | B2 | high | `foff_mhz` is unvalidated; Hz passed where MHz is expected blinds the search | `dsp/dedoppler.py` |
 | B3 | high | The classifier never sees the drift regime it must score in production | `ai/model.py` |
@@ -37,10 +35,10 @@ a plausible configuration · **low** = quality, debt or hygiene.
 | B14 | low | README commands fail when pasted into zsh | `README.md` |
 | B15 | low | The terminal dashboard leaves blank lines and torn panels | `dashboard.py` |
 
-**Suggested order.** B4 first (it is an unthrottled flood of a public research server).
-Then B9 + B6 + B8, which together decide whether any candidate this program produces is
-credible. Then B5 + B11, which decide whether the program looks at all of the data. Then B7,
-which needs cadence plumbing. Then B1 + B2 + B3, then the rest.
+**Suggested order.** B4 and B9 are done. Next is B6 + B8, which together decide whether any
+candidate this program produces is credible; then B5 + B11, which decide whether the program
+looks at all of the data. Then B7, which needs cadence plumbing. Then B1 + B2 + B3, then the
+rest.
 
 ---
 
@@ -50,7 +48,12 @@ which needs cadence plumbing. Then B1 + B2 + B3, then the rest.
 
 ### B4 — `remote_header` loops forever on an empty Range response, hammering the server
 
-`src/ai_seti/io/remote.py:50-65`. If a `206` response carries fewer bytes than the header
+> **Status: fixed.** `remote_header` now takes `max_requests` and `chunk`, stops when a
+> response adds no bytes, stops once `len(buf)` reaches the advertised `Content-Range` total,
+> and raises `ValueError` naming the URL instead of the old 1 MB guard. Regression test:
+> `test_remote_header_gives_up_when_the_server_stops_sending`.
+
+`src/ai_seti/io/remote.py:51-65`. If a `206` response carries fewer bytes than the header
 needs (empty body, truncated proxy reply), `buf` never grows, `parse_sigproc_header` keeps
 raising `EOFError`, and the `len(buf) > 1 << 20` exit is never reached:
 
@@ -78,6 +81,13 @@ total, cap the number of header requests (e.g. 64), and raise `ValueError` namin
 at most a handful of requests.
 
 ### B9 — on coarse products, drifts far beyond `max_drift_rate_hz_s` are searched and reported
+
+> **Status: fixed.** `_search_one_sign` now takes `k_limit_ch` (the ceiling in channels per
+> step) and skips every `(k, d)` row beyond it, so an out-of-range drift is never evaluated
+> and therefore never reported. When the ceiling is below one tree resolution step the tree
+> is skipped entirely and the zero-drift column sum is returned, which is exactly `tree[0]`.
+> Regression tests: `test_drift_search_never_reports_beyond_the_configured_rate` and
+> `test_drift_search_skips_the_tree_when_only_zero_drift_is_in_range`.
 
 The opposite failure of B1. `_search_one_sign` (`src/ai_seti/dsp/dedoppler.py:93-99`) loops
 `for d in range(tp)` regardless of `k_max`, so drift `d/span` is always searched up to
@@ -343,7 +353,7 @@ Listen archive.
 
 | Symptom in the log | Cause |
 |---|---|
-| Drifts of −276 to −1,225 Hz/s with a 4 Hz/s limit | B9 |
+| Drifts of −276 to −1,225 Hz/s with a 4 Hz/s limit | B9 — **fixed** |
 | Mid-res files take 110–124 s for 1 M channels | B10 (and B9) |
 | Top candidates `technosignature_like`, interest 78–94 | B6 mirror pairs, B7 multi-target, B8 saturation |
 | SNR 144,777 becomes the lifetime best | B8 |

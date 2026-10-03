@@ -39,7 +39,7 @@ blimpy/turboSETI are no longer required (optional `[compare]` extra for cross-ch
 ## Development and quality gates
 
 ```bash
-pytest                                   # 67 tests
+pytest                                   # 72 tests
 pytest --cov=ai_seti --cov-report=term-missing
 ruff check .                             # lint
 mypy                                     # typecheck (configured in pyproject.toml)
@@ -112,7 +112,7 @@ directly rather than post publicly.
 | Whole selection loaded via blimpy, single core. | Memory-mapped SIGPROC / chunked HDF5 reader; overlapping work units; process pool (1 BLAS thread per worker); HTTP Range streaming. |
 | No RFI handling, no AI. | Known-band flags, zero-drift penalty, ON/OFF cadence filter; gradient-boosted hit classifier + isolation-forest anomaly score → 0–100 interest score. |
 | Only one signal type. | + SETI@home-style spikes, + Astropulse-style dispersed pulses (for high-time-resolution products). |
-| Test fixture crashed for < 701 channels. | Fixed; 67 tests incl. a local Range-server streaming test, mocked GitHub/webhook sharing, and a drift search at real GBT coarse-channel resolution. |
+| Test fixture crashed for < 701 channels. | Fixed; 72 tests incl. a local Range-server streaming test, mocked GitHub/webhook sharing, and a drift search at real GBT coarse-channel resolution. |
 
 ## Review of v0.3 — what changed
 
@@ -127,6 +127,7 @@ The 0.3.0 pass is a correctness and honesty pass; no new signal processing.
 | Ledger wrote a fixed `.tmp` sibling (concurrent crunchers raced) and crashed on unknown keys. | Unique per-PID temp file, `os.replace`, cleanup on failure, unknown keys dropped with a warning. |
 | No CI; ruff and mypy ran on defaults with no config and failed (76 and 21 findings). | Declared `[tool.ruff.lint]` and `[tool.mypy]`; both are clean. Added CI across 3.11/3.12/3.13 plus a smoke job that fails if the bundled classifier stops loading. |
 | Report carried no version or build stamp. | `report.html` shows `v<version> · built <UTC>` and an AI-layer banner. |
+| First run against real Breakthrough Listen data (2026-10-03) exposed two more: a `206` with an empty body made `remote_header` re-request the same range forever (**17,681 requests in 3 s**, never terminating — an unthrottled flood of a public research server), and the Taylor tree reported drifts far past the configured ceiling (−276 to −1,225 Hz/s under a 4 Hz/s limit) because its `for d in range(tp)` sweep always reaches 1 ch/step. | `remote_header` now stops on lack of progress, bounded by `max_requests`. `drift_search` skips tree rows beyond `max_drift_rate_hz_s`, so a reported rate is always inside the configured range. |
 
 ## Results (measured on the development machine, 1 CPU core)
 

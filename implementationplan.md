@@ -35,6 +35,8 @@ quality gates enforceable.
 | 23 | Fix the stale `tests/test_model.py` path cited in the architecture notes | `ARCHITECTURE.md` | done |
 | 24 | Record the unhandled drift-range collapse in the failure-handling table | `ARCHITECTURE.md` | done |
 | 25 | State the drift-search and classifier-drift limitations in the README | `README.md` | done |
+| 26 | B4: stop `remote_header` re-requesting a range that returns no bytes | `io/remote.py` | done |
+| 27 | B9: never report a drift rate above `max_drift_rate_hz_s` | `dsp/dedoppler.py` | done |
 
 ## Test plan
 
@@ -75,10 +77,20 @@ One-liner per task, mapping to the test that would fail if the task were reverte
     asserts the start channel, drift and SNR are all recovered. Every other drift test uses a
     narrower synthetic grid, so none of them would have caught a wrong-unit `foff` collapsing
     the searchable drift to zero — the failure mode recorded as backlog B1/B2.
+13. **Task 26 — B4.** `test_remote_header_gives_up_when_the_server_stops_sending` serves an
+    empty but well-formed `206` and asserts `remote_header` raises within a second after at
+    most one wasted request. Measured against the pre-fix loop: 17,681 requests in 3 s, never
+    terminating.
+14. **Task 27 — B9.** `test_drift_search_never_reports_beyond_the_configured_rate` injects a
+    0.5 ch/step tone into a 2.86 kHz mid-resolution-shaped block (1 ch/step = 2,672 Hz/s),
+    asserts nothing is reported under a 4 Hz/s ceiling, and asserts the same tone *is*
+    recovered once the ceiling is raised above its own rate — so the cap filters rather than
+    disables the search. `test_drift_search_skips_the_tree_when_only_zero_drift_is_in_range`
+    pins the zero-drift shortcut.
 
 ## Verification performed
 
-- `pytest` — 67 tests, all green.
+- `pytest` — 72 tests, all green.
 - `pytest --cov=ai_seti` — **65%** (was 50%). `dsp/detectors.py` 28%→98%, `benchmark.py`
   0%→94%, `io/filterbank.py` 69%→91%, `config.py` 77%→100%, `report.py` 0%→85%,
   `state.py` 51%→93%, `rfi.py` 95%, `share.py` 93%, `pipeline.py` 88%.

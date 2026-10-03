@@ -44,7 +44,7 @@ def _would_be_ignored(rel_path: str) -> list[str]:
         pattern = line.lstrip("!").rstrip("/")
         if any(fnmatch.fnmatch(c, pattern) for c in candidates):
             ignored = not negate
-            matched = [] if negate else matched + [line]
+            matched = [] if negate else [*matched, line]
     return matched if ignored else []
 
 
@@ -216,6 +216,58 @@ def test_drift_search_recovers_a_tone_at_gbt_coarse_resolution():
         "a 13 ch/step tone must be labelled 13 ch/step, not smeared to a neighbour"
     assert best.snr > 10.0, "the recovered SNR must clear the threshold it was found at"
     assert float(snr[8000]) > 10.0, "the SNR map must carry the detection for the dashboard"
+
+
+def test_drift_search_never_reports_beyond_the_configured_rate():
+    """Reported drift rates must respect `max_drift_rate_hz_s` (backlog B9).
+
+    The Taylor tree always sweeps drift 0…1 ch/step because of its `for d in range(tp)`
+    term, even when `k_max == 0`. On a coarse product one channel per step is far past the
+    configured ceiling: the BL mid-resolution product (`.0002`, 2.86 kHz × 1.07 s) makes one
+    channel per step ±2,665 Hz/s. A real run reported candidates at −276 to −1,225 Hz/s
+    with a 4 Hz/s limit.
+    """
+    foff_mhz = 2860.0e-06          # 2.86 kHz channels: 1 ch/step is 2,672 Hz/s at tsamp 1.07
+    tsamp = 1.07
+    rng = np.random.default_rng(21)
+    data = noise_waterfall(256, 8192, rng)
+    inject(data, Injection("technosignature_like", 4000.0, 0.5, 8.0, 1.0), rng)
+    z = normalize(data, block=256)
+
+    # 4 Hz/s is 0.0015 ch/step on this product, so the 0.5 ch/step tone sits far outside the
+    # ceiling and must not be reported at all. Before the fix it came back at -1,329.7 Hz/s.
+    tight, _ = drift_search(z, tsamp=tsamp, foff_mhz=foff_mhz, max_drift_hz_s=4.0,
+                            snr_threshold=8.0)
+    assert all(abs(h.drift_rate_hz_s) <= 4.0 for h in tight), \
+        "no reported hit may exceed the configured rate"
+    assert not any(abs(h.drift_ch_per_step - 0.5) < 0.05 for h in tight), \
+        "a 0.5 ch/step tone is ~1,336 Hz/s here and must not survive a 4 Hz/s ceiling"
+
+    # The same search with a ceiling that admits the tone must still recover it, so the cap
+    # filters the reported range rather than silently disabling the drift search.
+    loose, _ = drift_search(z, tsamp=tsamp, foff_mhz=foff_mhz, max_drift_hz_s=1400.0,
+                            snr_threshold=8.0)
+    assert any(abs(h.drift_ch_per_step - 0.5) < 0.05 for h in loose), \
+        "a ceiling above the tone's own rate must still recover it"
+    assert all(abs(h.drift_rate_hz_s) <= 1400.0 for h in loose)
+
+
+def test_drift_search_skips_the_tree_when_only_zero_drift_is_in_range():
+    """Below 1/span channels per step, the column sum is the whole answer.
+
+    A coarse product can make `max_drift_rate_hz_s` correspond to far less than one channel
+    per step. Skipping the tree is then an exact shortcut, not an approximation, because
+    `tree[0]` is precisely the column sum.
+    """
+    rng = np.random.default_rng(22)
+    data = noise_waterfall(64, 4096, rng)
+    inject(data, Injection("technosignature_like", 2000.0, 0.0, 8.0, 1.0), rng)
+    z = normalize(data, block=256)
+    # 0.01 Hz/s at 2.86 kHz channels is 3.7e-6 ch/step, far below the 1/63 tree resolution.
+    hits, _ = drift_search(z, tsamp=1.07, foff_mhz=2860.0e-06, max_drift_hz_s=0.01,
+                           snr_threshold=8.0)
+    assert hits, "a zero-drift carrier must survive the ceiling"
+    assert all(h.drift_ch_per_step == 0.0 for h in hits)
 
 
 def test_drift_ceil_respects_configured_cap():

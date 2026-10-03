@@ -48,21 +48,40 @@ def _get(url: str, start: int | None = None, stop: int | None = None,
     raise ConnectionError(f"GET {url} failed after {retries} attempts: {last}")
 
 
-def remote_header(url: str) -> FilterbankHeader:
-    total = None
+def remote_header(url: str, max_requests: int = 64, chunk: int = 16384) -> FilterbankHeader:
+    """Read a SIGPROC header over HTTP Range requests.
+
+    A proxy or a flaky link can answer `206` with an empty or truncated body. The request is
+    then re-issued for the same bytes forever, which is an unthrottled flood of a public
+    research server, so this loop must terminate on lack of progress rather than on success
+    alone (backlog B4). Every request either grows the buffer, advances towards the size the
+    server advertised, or ends the attempt.
+    """
+    total: int | None = None
     buf = b""
-    chunk = 16384
-    while True:
-        body, hdrs, _ = _get(url, len(buf), len(buf) + chunk)
-        buf += body
+    for _ in range(max_requests):
+        stop = len(buf) + chunk if total is None else min(len(buf) + chunk, total)
+        if stop <= len(buf):
+            break  # we already hold every byte the server says exist
+        body, hdrs, _ = _get(url, len(buf), stop)
         m = re.search(r"/(\d+)$", hdrs.get("Content-Range", ""))
         if m:
             total = int(m.group(1))
+        if not body:
+            break  # no progress; asking again would just repeat the same request
+        buf += body
         try:
             return parse_sigproc_header(buf, total)
-        except EOFError as exc:
-            if len(buf) > 1 << 20:
-                raise ValueError("SIGPROC header larger than 1 MB?") from exc
+        except EOFError:
+            continue  # header spans more bytes than we hold
+    try:
+        return parse_sigproc_header(buf, total)
+    except EOFError as exc:
+        raise ValueError(
+            f"No SIGPROC header in the first {len(buf)} bytes of {url} after "
+            f"{max_requests} Range requests (file size {total}): the server stopped "
+            f"sending data"
+        ) from exc
 
 
 def remote_window(url: str, header: FilterbankHeader, chan_start: int, chan_stop: int,

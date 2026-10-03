@@ -79,11 +79,21 @@ def _sheared_view(padded, k: int, width: int, xp=np):
     return out
 
 
-def _search_one_sign(z, k_max: int, xp=np):
-    """Best path sum / drift(ch per step) per start channel for non-negative drifts."""
+def _search_one_sign(z, k_max: int, xp=np, k_limit_ch: float | None = None):
+    """Best path sum / drift(ch per step) per start channel for non-negative drifts.
+
+    `k_limit_ch` caps the drift in channels per step. Rows beyond it are skipped, so the
+    search cannot report a drift rate the caller explicitly excluded. Without this, the
+    `for d in range(tp)` sweep always reaches drift 1 ch/step even when `k_max == 0`, which
+    on a coarse product is thousands of Hz/s past the configured ceiling (backlog B9).
+    """
     t_real, f = z.shape
     tp = 1 << max(1, int(np.ceil(np.log2(max(t_real, 2)))))
     span = tp - 1
+    if k_limit_ch is not None and k_limit_ch < 1.0 / span:
+        # Only zero drift is in range, so the column sum is the entire answer and the tree
+        # is pure overhead. `tree[0]` is exactly this sum.
+        return xp.asarray(z.sum(axis=0), dtype=xp.float32), xp.zeros(f, dtype=xp.float32)
     pad = (k_max + 1) * span + 1
     padded = xp.zeros((tp, f + pad), dtype=xp.float32)
     padded[:t_real, :f] = z
@@ -93,6 +103,8 @@ def _search_one_sign(z, k_max: int, xp=np):
     for k in range(k_max + 1):
         tree = taylor_tree(_sheared_view(padded, k, f + span + 1, xp), xp)
         for d in range(tp):
+            if k_limit_ch is not None and (k + d / span) > k_limit_ch + 1e-9:
+                continue
             row = tree[d, :f]
             xp.greater(row, best, out=mask)
             xp.copyto(best, row, where=mask)
@@ -133,8 +145,8 @@ def drift_search(z: np.ndarray, tsamp: float = 1.0, foff_mhz: float = 1e-6,
 
     zx = xp.asarray(z, dtype=xp.float32)
     med, scale = _noise_scale(zx, xp)
-    pos_snr, pos_drift = _search_one_sign(zx, k_max, xp)
-    neg_snr, neg_drift = _search_one_sign(xp.ascontiguousarray(zx[:, ::-1]), k_max, xp)
+    pos_snr, pos_drift = _search_one_sign(zx, k_max, xp, k_needed)
+    neg_snr, neg_drift = _search_one_sign(xp.ascontiguousarray(zx[:, ::-1]), k_max, xp, k_needed)
     pos_snr = (pos_snr - med) / scale
     neg_snr = (neg_snr - med) / scale
     neg_snr, neg_drift = neg_snr[::-1], -neg_drift[::-1]
