@@ -352,3 +352,23 @@ def test_midres_hits_are_drift_unresolved_not_stationary():
     rec = {"checklist": checklist(unresolved, "not_run", False), "assessment": {"cadence": "not_run"}}
     ok, why = passes_gate(rec)
     assert not ok and "not measurable" in why
+
+
+def test_training_set_fills_every_class():
+    """B20: the noise class used to stop at ~22% of the requested examples, silently."""
+    from ai_seti.ai.model import build_training_set
+
+    _, y = build_training_set(n_per_class=15, seed=3)
+    assert np.bincount(y, minlength=len(LABELS)).tolist() == [15] * len(LABELS)
+
+
+def test_training_shortfall_is_reported(monkeypatch, caplog):
+    import ai_seti.ai.model as model
+
+    real = model._training_example
+    monkeypatch.setattr(model, "_training_example",
+                        lambda kind, rng, **k: None if kind == "noise" else real(kind, rng, **k))
+    with caplog.at_level("WARNING"):
+        _, y = model.build_training_set(n_per_class=2, seed=0)
+    assert (y == LABELS.index("noise")).sum() == 0
+    assert "noise has 0 of 2" in caplog.text

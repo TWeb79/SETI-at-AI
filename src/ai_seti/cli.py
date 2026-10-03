@@ -165,13 +165,22 @@ def analyze(path: str, outdir: Path = typer.Option(Path("reports/analysis")),
 @app.command()
 def status():
     """Check the SETI@home and Breakthrough Listen data servers."""
-    from .sources import BreakthroughListenSource, SetiAtHomeSource
-    s = SetiAtHomeSource.probe()
-    colour = "green" if s["distributing"] else "yellow"
+    from .sources import BL_API, SAH_STATUS, BreakthroughListenSource, SetiAtHomeSource
+    print(f"[dim]Checking {SAH_STATUS} …[/dim]")
+    s = SetiAtHomeSource.probe(timeout=10.0)
+    colour = "green" if s["distributing"] else "yellow" if s["reachable"] else "red"
     print(f"SETI@home: [{colour}]{s['detail']}[/{colour}]")
+    if not s["reachable"]:
+        print("[dim]  SETI@home has been hibernating since 2020; AI-SETI does not need it.[/dim]")
+    # An empty target matches nothing, so it could not tell a working archive from an empty
+    # answer (backlog B13). Ask for one row of a target that is known to exist.
+    print(f"[dim]Checking {BL_API} …[/dim]")
     try:
-        rows = BreakthroughListenSource(target="", limit=3).query()
-        print(f"Breakthrough Listen Open Data: [green]reachable[/green] ({len(rows)} sample rows)")
+        rows = BreakthroughListenSource(target="HIP", limit=1).query(timeout=10.0, retries=1)
+        if rows:
+            print("Breakthrough Listen Open Data: [green]reachable[/green] (query returned data)")
+        else:
+            print("Breakthrough Listen Open Data: [yellow]answered, but returned no rows[/yellow]")
     except Exception as exc:
         print(f"Breakthrough Listen Open Data: [red]unreachable[/red] ({exc})")
 

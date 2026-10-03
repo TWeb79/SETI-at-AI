@@ -416,3 +416,28 @@ def test_same_target_seen_twice_is_not_multi_target():
     out = flag_multi_target(df, [[1420.0, "HIP2"]], "HIP1")
     assert out.set_index("frequency_mhz")["multi_target"].to_dict() == {1420.0001: True, 1500.0: False}
     assert out.iloc[0]["frequency_mhz"] == 1500.0, "flagged hit drops below the clean one"
+
+
+def test_status_distinguishes_empty_answer_from_working_archive(monkeypatch):
+    """B13: status queried an empty target, so '0 sample rows' looked like success."""
+    from typer.testing import CliRunner
+
+    import ai_seti.sources as sources
+    from ai_seti.cli import app
+
+    monkeypatch.setattr(sources.SetiAtHomeSource, "probe", staticmethod(
+        lambda timeout=15.0: {"reachable": False, "distributing": False,
+                              "detail": "unreachable (The handshake operation timed out)"}))
+    asked = {}
+
+    def fake_query(self, limit=None, timeout=60.0, retries=3):
+        asked.update(target=self.params["target"], timeout=timeout)
+        return answer
+
+    monkeypatch.setattr(sources.BreakthroughListenSource, "query", fake_query)
+    answer = [{"url": "http://x/a.fil"}]
+    out = CliRunner().invoke(app, ["status"]).output
+    assert "reachable (query returned data)" in out and "hibernating" in out
+    assert asked["target"] and asked["timeout"] <= 10, "a real target, a short timeout"
+    answer = []
+    assert "returned no rows" in CliRunner().invoke(app, ["status"]).output

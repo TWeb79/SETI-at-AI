@@ -151,11 +151,12 @@ class BreakthroughListenSource:
         self.cache_dir = Path(cache_dir)
         self.max_download_mb = max_download_mb
 
-    def query(self, limit: int | None = None) -> list[dict]:
+    def query(self, limit: int | None = None, timeout: float = 60.0,
+              retries: int = 3) -> list[dict]:
         params = {**self.params, **({"limit": str(limit)} if limit else {})}
         url = f"{BL_API}/query-files?" + urllib.parse.urlencode(
             {k: v for k, v in params.items() if v not in (None, "")})
-        body, _, _ = remote._get(url)
+        body, _, _ = remote._get(url, timeout=timeout, retries=retries)
         payload = json.loads(body)
         rows = payload.get("data", payload) if isinstance(payload, dict) else payload
         return [r for r in rows if isinstance(r, dict) and r.get("url")]
@@ -206,7 +207,9 @@ class SetiAtHomeSource:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 text = resp.read().decode("utf-8", "replace")
         except Exception as exc:
-            return {"reachable": False, "distributing": False, "detail": str(exc)}
+            # URLError wraps the useful part ("The handshake operation timed out") in .reason.
+            reason = getattr(exc, "reason", exc)
+            return {"reachable": False, "distributing": False, "detail": f"unreachable ({reason})"}
         ready = [int(x) for x in re.findall(r"<results_ready_to_send>(\d+)<", text)]
         distributing = any(r > 0 for r in ready)
         return {"reachable": True, "distributing": distributing,

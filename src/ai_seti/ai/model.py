@@ -74,13 +74,18 @@ def _training_example(kind: str, rng, n_time=16, n_chan=4096, max_drift=6.0):
     return feature_vector(feats, img)
 
 
+# Pure noise yields a usable (>5 sigma) hit on ~4% of tries at 4 ms each, so filling the
+# noise class needs ~25 tries per example; the old x4 budget stopped at ~110 of 500 (B20).
+TRIES_PER_EXAMPLE = 30
+
+
 def build_training_set(n_per_class: int = 400, seed: int = 0, progress=None):
     rng = np.random.default_rng(seed)
     xs, ys = [], []
     total = n_per_class * len(LABELS)
     for li, label in enumerate(LABELS):
         got, tries = 0, 0
-        while got < n_per_class and tries < n_per_class * 4:
+        while got < n_per_class and tries < n_per_class * TRIES_PER_EXAMPLE:
             tries += 1
             v = _training_example(label, rng)
             if v is not None:
@@ -89,6 +94,9 @@ def build_training_set(n_per_class: int = 400, seed: int = 0, progress=None):
                 got += 1
                 if progress:
                     progress(len(xs), total)
+        if got < n_per_class:
+            logger.warning("Training class %s has %d of %d requested examples after %d tries; "
+                           "the classifier will under-learn it.", label, got, n_per_class, tries)
     return np.vstack(xs), np.asarray(ys)
 
 
@@ -109,6 +117,7 @@ def train(n_per_class: int = 400, seed: int = 0, out: Path = DEFAULT_MODEL, prog
     meta = {"labels": LABELS, "scalar_features": SCALAR_FEATURES, "test_accuracy": acc,
             "confusion_matrix": cm, "n_train": len(ytr), "train_seconds": time.time() - t0,
             "snr_max": float(x[:, SCALAR_FEATURES.index("snr")].max()),
+            "class_counts": {lab: int((y == i).sum()) for i, lab in enumerate(LABELS)},
             # Recorded so a load-time mismatch can be reported precisely instead of guessed.
             "sklearn_version": sklearn.__version__, "numpy_version": np.__version__}
     joblib.dump({"model": clf, "meta": meta}, out)
