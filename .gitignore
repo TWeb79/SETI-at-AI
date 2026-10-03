@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+
+# Runtime data: raw observations stay immutable and are never committed.
+# A Breakthrough Listen coarse channel is hundreds of MB; regenerable with `ai-seti demo`.
+data/raw/*
+data/processed/*
+data/candidates/*
+data/state.json
+data/bl/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/candidates/.gitkeep
+
+# Generated reports and share bundles
+reports/*
+!reports/.gitkeep
+
+# Local scratch
+*.fil
+*.h5
+*.hdf5
+*.part
+*.tmp
+.DS_Store
+.idea/
+.vscode/

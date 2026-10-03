@@ -1,0 +1,23 @@
+{
+  "channels_per_unit": 262144,
+  "max_drift_rate_hz_s": 4.0,
+  "snr_threshold": 10.0,
+  "spike_threshold": 9.0,
+  "pulse_threshold": 8.0,
+  "bandpass_block": 512,
+  "remove_dc_spike": true,
+  "use_ai": true,
+  "workers": 0,
+  "use_gpu": false,
+  "max_download_mb": 2048,
+  "share_to": [
+    "bundle"
+  ],
+  "share_min_interest": 70.0,
+  "share_top": 3,
+  "share_require_cadence": false,
+  "github_repo": null,
+  "webhook_url": null,
+  "webhook_format": "json",
+  "reporter_handle": null
+}

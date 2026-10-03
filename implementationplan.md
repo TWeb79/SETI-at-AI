@@ -1,0 +1,86 @@
+# Implementation plan — AI-SETI 0.3.0 hardening pass
+
+Author: Inventions4All — github:TWeb79
+
+Scope: close the gaps found in the 0.3.0 review. No new signal-processing features; this
+pass is about correctness, honesty about what the software actually did, and making the
+quality gates enforceable.
+
+## Task list
+
+| # | Task | Module | Status |
+|---|---|---|---|
+| 1 | Pin `scikit-learn<1.9` so the bundled pickled estimator loads | `pyproject.toml` | done |
+| 2 | Record the sklearn/numpy version in the trained model metadata | `ai/model.py` | done |
+| 3 | Stop swallowing classifier load failures: log + expose `load_error` | `ai/model.py` | done |
+| 4 | Distinguish `model_unavailable` / `ai_disabled` from `unscored` | `pipeline.py` | done |
+| 5 | Write the AI-layer failure into `metadata.json` and the HTML report | `report.py` | done |
+| 6 | Make `max_drift_ch_per_step` an effective cap, shared with the guard band | `sources.py`, `pipeline.py` | done |
+| 7 | Refuse a cadence "pass" from a single ON scan with no OFF scan | `rfi.py` | done |
+| 8 | Re-check cadence status when grading a finding for sharing | `share.py` | done |
+| 9 | Key the share dedupe on `finding_id` instead of record equality | `share.py` | done |
+| 10 | Unique temp file for the ledger; tolerate unknown ledger keys | `state.py` | done |
+| 11 | Declare `ruff` lint rules and a `mypy` configuration | `pyproject.toml` | done |
+| 12 | Fix every ruff finding (76 at the start) | all | done |
+| 13 | Fix the 10 genuine mypy errors | all | done |
+| 14 | Version + build datetime stamp in the report UI | `report.py` | done |
+| 15 | CI: lint, typecheck, tests on 3.11/3.12/3.13 + smoke job | `.github/workflows/ci.yml` | done |
+| 16 | `.gitignore`, `ARCHITECTURE.md`, `requirements.txt` | repo root | done |
+| 17 | Regression tests for tasks 1, 6, 7, 8, 9, 10 | `tests/` | done |
+| 18 | Correct stale README claims | `README.md` | done |
+| 19 | Close the coverage gaps the review exposed: `dsp/detectors.py` 28%, `benchmark.py` 0%, `io/filterbank.py` 69%, `state.py` 51% | `tests/` | done |
+| 20 | Fix `channel_range` returning an inverted range for out-of-band requests | `io/filterbank.py` | done |
+
+## Test plan
+
+One-liner per task, mapping to the test that would fail if the task were reverted.
+
+1. **Task 1/2 — bundled model loads.** `test_bundled_classifier_loads`: `HitScorer().available`
+   is true, and `predict` returns finite probabilities instead of NaN. Reverting the pin or
+   the `except Exception` fallback fails this.
+2. **Task 3/4 — failure is visible.** `test_model_load_failure_is_reported`: point the scorer at
+   a corrupt file and assert `load_error` is set; `test_score_candidates_flags_unavailable_model`
+   asserts `ai_class == "model_unavailable"` rather than a silent `unscored`.
+3. **Task 5 — failure reaches the report.** `test_write_outputs_records_ai_note`: a candidate
+   frame with `model_unavailable` produces `stats["ai_note"]`.
+4. **Task 6 — drift cap is real.** `test_drift_cap_limits_searched_paths`: raising
+   `max_drift_ch_per_step` raises the recovered drift of a fast tone; `test_drift_padding_matches_searched_drift`
+   asserts the guard band is at least the drift the search can cover, so the two never drift apart.
+5. **Task 7 — cadence needs a real test.** `test_cadence_rejects_single_on_scan_without_off`:
+   one ON scan, no OFF, yields no events. `test_cadence_requires_off_scan` and
+   `test_cadence_passes_with_on_and_off` pin the accept/reject boundaries.
+6. **Task 8 — share grading.** `test_cadence_status_rejects_thin_events`: a hand-written
+   `events.csv` claiming one ON scan grades as `failed`, not `passed`.
+7. **Task 9 — dedupe keys.** `test_webhook_and_ledger_dedup` (existing) covers ledger reuse;
+   `test_share_dedupes_by_id_not_record_value` sends two records with identical payloads but
+   distinct IDs and asserts both are delivered.
+8. **Task 10 — ledger robustness.** `test_ledger_roundtrip_and_best`,
+   `test_ledger_ignores_unknown_keys`, `test_ledger_save_is_atomic`.
+9. **Task 20 — inverted channel range.** `test_channel_range_out_of_band_is_empty_never_inverted`:
+   a wholly out-of-band request must not return `c1 < c0`.
+10. **Task 19 — detector coverage.** `test_find_pulses_recovers_a_dispersed_burst` builds a real
+    dispersed burst in the 100–200 MHz pulsar band and asserts the recovered DM is the
+    injected one, not merely positive. Plus spike localisation, IF-axis selection for 3-D
+    HDF5, config load/round-trip, and two benchmark assertions including the headline claim
+    that v0.2 beats v0.1 on a drifting tone.
+11. **Regression suite.** All 15 pre-existing tests still pass, including
+    `test_pipeline_finds_injected_signal_once`, whose drift expectations the cap still satisfies.
+
+## Verification performed
+
+- `pytest` — 66 tests, all green.
+- `pytest --cov=ai_seti` — **65%** (was 50%). `dsp/detectors.py` 28%→98%, `benchmark.py`
+  0%→94%, `io/filterbank.py` 69%→91%, `config.py` 77%→100%, `report.py` 0%→85%,
+  `state.py` 51%→93%, `rfi.py` 95%, `share.py` 93%, `pipeline.py` 88%.
+  `cli.py` and `dashboard.py` remain at 0% by design — the CI smoke job covers them instead.
+- `ruff check .` — clean (was 76 findings).
+- `mypy` — clean, 23 source files (was 21 errors).
+- CLI smoke: `demo`, `analyze`, `inspect`, `status`, `crunch`, `cadence`, `benchmark`, `share`.
+
+## Outcome worth noting
+
+With the classifier actually loading, `ai-seti demo` now recovers the three hidden ET-like
+tones at ranks **#1, #2 and #3**, all classified `technosignature_like`, ahead of the
+strongest RFI (interest 74–82 vs 28–32). Before the fix the same run reported `unscored`
+for every candidate and the README's "#1–#3" claim was false — the AI layer was doing
+nothing. Single-core demo time is 2.4 s wall / 2.3 s CPU.
