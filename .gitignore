@@ -34,9 +34,23 @@ data/bl/
 !data/processed/.gitkeep
 !data/candidates/.gitkeep
 
-# Generated reports and share bundles
+# Generated reports and share bundles (`share` writes bundles to reports/share).
 reports/*
 !reports/.gitkeep
+
+# Raw observation formats are ignored by extension, so a deliberate regression fixture
+# under tests/ would be swallowed too. Re-include them if fixtures are ever added.
+!tests/**/*.fil
+!tests/**/*.h5
+!tests/**/*.hdf5
+
+# Secrets. `share --to github` reads AI_SETI_GITHUB_TOKEN from the environment (never from a
+# file); a Discord/Slack webhook URL passed via `--webhook` is itself a credential, so a
+# personal config kept alongside the tracked configs/default.json must not be committed.
+.env
+.env.*
+!.env.example
+configs/*.local.json
 
 # Local scratch
 *.fil
@@ -44,6 +58,11 @@ reports/*
 *.hdf5
 *.part
 *.tmp
+*.log
+*.orig
+*.rej
+.streamlit/
 .DS_Store
 .idea/
 .vscode/
+.ipynb_checkpoints/

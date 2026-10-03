@@ -4,6 +4,9 @@ Each test names the defect it pins down, so a revert fails loudly rather than si
 reintroducing the behaviour. See implementationplan.md for the mapping.
 """
 
+import fnmatch
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -19,6 +22,53 @@ from ai_seti.report import write_outputs
 from ai_seti.sources import drift_ceil_ch_per_step, drift_padding, split
 
 FEATURE_WIDTH = len(SCALAR_FEATURES) + 16 * 16   # scalars + de-drifted snippet
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _would_be_ignored(rel_path: str) -> list[str]:
+    """Approximate gitignore matching; returns the patterns that exclude `rel_path`, or [].
+
+    Later patterns win, as in git: a matching negation (`!`) re-includes the path, which is
+    what keeps the `.gitkeep` placeholders trackable under `reports/*` and `data/raw/*`. A
+    pattern matches when it covers the path or any ancestor directory.
+    """
+    parts = rel_path.split("/")
+    candidates = ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+    matched: list[str] = []
+    ignored = False
+    for raw in (PROJECT_ROOT / ".gitignore").read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        pattern = line.lstrip("!").rstrip("/")
+        if any(fnmatch.fnmatch(c, pattern) for c in candidates):
+            ignored = not negate
+            matched = [] if negate else matched + [line]
+    return matched if ignored else []
+
+
+def test_bundled_model_artifact_is_not_gitignored():
+    """The shipped classifier must stay in version control.
+
+    If this artifact is ever excluded, a fresh clone silently ships with no AI layer and
+    every candidate comes back `unscored` — precisely the failure the 0.3.0 pass was built to
+    stop hiding. A broad `*.pkl`/`*.joblib`/`src/` rule would reintroduce it invisibly.
+    """
+    artifact = Path("src/ai_seti/ai/hit_classifier.joblib")
+    assert (PROJECT_ROOT / artifact).is_file(), "the bundled model must exist in the tree"
+    assert _would_be_ignored(str(artifact)) == [], \
+        f"{artifact} must be committed; matched {artifact} would be ignored"
+
+
+def test_runtime_data_is_gitignored():
+    """Regenerable observations, caches and reports must not be committable by accident."""
+    for rel in ("data/state.json", "data/raw/bl/obs.fil", "reports/crunch/x/report.html",
+                "reports/share/finding.json", ".coverage", ".venv/bin/python"):
+        assert _would_be_ignored(rel), f"{rel} should be ignored"
+    for rel in ("README.md", "pyproject.toml", "requirements.txt", "configs/default.json",
+                "tests/test_core.py", "reports/.gitkeep", "data/raw/.gitkeep"):
+        assert _would_be_ignored(rel) == [], f"{rel} must stay trackable"
 
 
 # ---------------------------------------------------------------- classifier artifact
