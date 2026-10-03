@@ -5,9 +5,10 @@ Author: Inventions4All — github:TWeb79
 Applies to: **v0.3.0**. Opened at the end of the 0.3.0 hardening pass
 (see [implementationplan.md](implementationplan.md)).
 
-Fixed items are removed from this file once done (last cleanup 2026-10-03: B39, B44, B43, B42, B40, B38, B7, B37, B36, B29, B19, B28, B10, B31, B33, B34, B35, B32, B30, B21, B27, B15, B1, B2, B22, B23, B24, B25, B26, B16, B14, B17, B12, B4, B5, B6, B8,
-B9, B11, B13, B18, B20, B7(b) and B19's labelling). Their write-ups, the two real-data runs of
-2026-10-03 and the regression tests that pin them are in git history.
+Fixed items are removed from this file once done. As of 2026-10-03 everything from B1 to B44 is
+fixed, or closed with a measured reason (B10, B40). The write-ups, the real-data runs of
+2026-10-03 and the regression tests that pin them are in git history; the performance
+measurements are kept below because they still describe how `crunch` spends its time.
 
 Items are sorted by severity, then by the order they should be fixed in. **IDs are stable and
 must not be renumbered** — other documents and the tables below cross-reference them.
@@ -19,45 +20,14 @@ a plausible configuration · **low** = quality, debt or hygiene.
 
 | ID | Severity | Summary | Area |
 |---|---|---|---|
-| B41 | low | An OFF scan crunched on its own re-downloads ranges its cadence already searched (cadence-to-cadence reuse is done) | `cli.py`, `state.py` |
-| B3 | high | The classifier never sees the drift regime it must score in production | `ai/model.py` |
 
-**Suggested order.** The performance findings of 2026-10-03 (B38–B44): B38 first (a one-line
-change, the biggest gain in `--forever` mode), then B39 (status), B42 (process pool),
-B41 (cadence cost), B43, B44. Then B3 (retrain).
+**Nothing is pending.** Every item found so far is fixed or closed; add new ones above.
 
 ---
 
 # Bugs
 
 ## High
-
-### B3 — the classifier never sees the drift regime it has to score in production
-
-`ai/model.py:40` builds training examples with `n_chan=4096, max_drift=6.0`, and
-`ai/simulate.py:89` draws `technosignature_like` drift from `uniform(0.05, max_drift)`, i.e.
-**0.05–6 channels/step**. Production on a GBT coarse channel is ~2.794 Hz / 18.25 s, where
-the 4 Hz/s rate limit is already **~26 channels/step** (README documents this).
-
-So the model is trained exclusively on slow drift and is asked to classify fast drift. Its
-class labels are least reliable in exactly the regime the search spends most of its time in.
-The 95.7% held-out accuracy figure in the README is measured on the training distribution and
-does not transfer.
-
-**Fix.** Widen `max_drift` (and probably `n_chan`) in `_training_example` to cover the
-production range, then retrain and re-measure. Report accuracy as a function of drift.
-
-**Note.** A sweep over a production-regime training set was started and abandoned — the run
-cost is high (27 Taylor-tree passes per sign per example, ~0.27 s/example, and rejected
-examples are retried up to `n_per_class * 4` times). Budget for a reduced sweep before
-committing to it.
-
-**Also in this retrain.** The bundled model predates the B20 fix, so its noise class has ~110
-examples instead of 500; a retrain with the current code fills it (55 s, accuracy 0.963 vs
-0.957, measured 2026-10-03). Add a strong-carrier RFI class to the simulator (high SNR, slow
-drift), the open part of the former B8. Strong, slowly drifting carriers are among the most
-common terrestrial RFI, and the classifier has never seen one. Until then the SNR guard in
-`ai.model.ood_snr_limit` labels such hits `out_of_distribution`.
 
 ## Performance of `crunch --forever` (analysed 2026-10-03)
 
@@ -79,20 +49,6 @@ The search itself is not the bottleneck: the CPU workers wait on the network ~95
 time. The levers are, in order: don't sleep while work is waiting (B38), make each byte cheaper
 to fetch (B40), don't fetch the same bytes twice (B41), and stop paying fixed costs per
 observation (B42, B43).
-
-### B41 — an OFF scan crunched on its own re-downloads ranges its cadence already searched
-
-Half done. Every searched (scan, channel range) now caches its hits under `data/cache/hits/`
-(keyed by URL, range, search settings and scoring version), and the cadence step reads the
-cache before downloading. So the 2nd and 3rd target scans of a cadence download only
-themselves (test: `test_cadence_reuses_scans_already_searched`, 4 → 1 searches). What remains:
-when the archive later returns an OFF scan (e.g. HIP2579) as an observation of its own, `crunch`
-downloads ranges the cadence step already searched, because its report needs full per-unit
-results (spikes, thumbnails, timings), not just hits.
-
-**Fix.** Either cache full unit results (bigger, but complete), or let `crunch` build the
-report for such a range from the cached hits and skip the download, marking the report "from
-cadence search".
 
 ## Medium
 
@@ -141,6 +97,12 @@ These are documented honestly in the README but have no plan attached:
 
 ## Verified — *not* bugs
 
+
+**"Non-power-of-two time samples double the Taylor-tree cost" (B10).** True (0.70 s at T = 279
+vs 0.31 s at T = 256 on 32k channels), but closed 2026-10-03: no Breakthrough Listen product
+reaches that path any more. High-res files have T = 16, and mid-res files skip the tree
+because drift is unmeasurable there (and `crunch` now skips them). Revisit only if a product
+with a non-power-of-two T *and* measurable drift turns up.
 
 **"Keep-alive connections, fewer threads or prefetching will speed up `crunch`."** Tried and
 measured 2026-10-03 (B40), then reverted. A kept-alive connection carries about twice the data

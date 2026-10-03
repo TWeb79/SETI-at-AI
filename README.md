@@ -160,7 +160,7 @@ impostor.
 | **Only at the target** | A signal from a star is only seen when the telescope points at that star. | Same frequency, or a busy band, already seen at *another* star → `multi_target`; the ON/OFF cadence (`cadence = failed` cuts the score to a fifth) | anything picked up through the side of the beam |
 | **Not an instrument artefact** | GBT coarse channels make mirror copies of strong tones around each channel centre. | `mirror_pair`, `mirror_image` (score cut to a fifth) | the receiver's own spectral images |
 | **Outside known interference bands** | GPS, Galileo, Iridium, Inmarsat and others own fixed bands. | `known_rfi_band` (score halved) | satellites |
-| **Plausible strength** | The AI was trained on SNRs up to ~40. Far stronger tones are almost always nearby transmitters. | `out_of_distribution`: score cut by 70% and capped at 50 | strong terrestrial carriers |
+| **Plausible strength** | Strong, steady, slowly drifting tones are almost always nearby transmitters. | the AI's `rfi_strong_carrier` class; beyond 3× the strongest training signal, `out_of_distribution` (score cut by 70% and capped at 50) | strong terrestrial carriers |
 
 **What the drift tells you.** Drift is acceleration along the line of sight:
 `a = c × drift / frequency`. Earth's own rotation gives about 0.03 m/s², which is about
@@ -231,8 +231,7 @@ The technical one-screen version is [How a work unit is processed](#how-a-work-u
 runs the strongest test, pointing away and back (the ON/OFF cadence), automatically when it
 processes the *target* scan of an archive cadence. It searches the same channels in the other
 five scans, and each hit's `cadence` column says `passed`, `failed`, `untestable` (an OFF
-pointing, or too few scans) or `not_run`. A pass still needs a re-observation, and the
-classifier has only seen slower drifts than the search covers (backlog B3).
+pointing, or too few scans) or `not_run`. A pass still needs a re-observation.
 
 ## Where unusual signals end up, and how to report them
 
@@ -282,7 +281,7 @@ one; it only changes labels and the order of the list.
 | Is there a narrow line in the data, and how does it drift? | **search** (deterministic) | bandpass removal, Taylor-tree de-Doppler, SNR threshold |
 | How wide, steady and wobbly is it? | **search** | measured features of each hit |
 | Is it in a satellite band, a mirror image, seen at another star, unmeasurable in drift? | **search** (rules) | the flags in `candidates.csv` |
-| Does it *look like* an ET-like tone or a known kind of interference? | **AI: classifier** | gradient-boosted trees on the features + a 16×16 de-drifted image, trained on simulated hits that went through this exact pipeline; 6 classes (`technosignature_like`, 4 interference shapes, `noise`) |
+| Does it *look like* an ET-like tone or a known kind of interference? | **AI: classifier** | gradient-boosted trees on the features + a 16×16 de-drifted image, trained on simulated hits that went through this exact pipeline, over the full drift range; 7 classes (`technosignature_like`, 5 interference types including `rfi_strong_carrier`, `noise`) |
 | Is it unlike everything else in this observation? | **AI: anomaly detector** | an isolation forest fitted fresh on each run's hits; 0–1 |
 | How interesting is it overall? | **both** | `interest = 100 × (0.55 × p(ET-like) + 0.20 × f(SNR) + 0.25 × anomaly)`, then the rule penalties (zero drift ×0.3, RFI band ×0.5, wider than 8 channels ×0.4, mirror ×0.2, seen elsewhere ×0.2) and, for `out_of_distribution`, ×0.3 and a cap of 50 |
 
@@ -449,8 +448,8 @@ noise-only 16×16384 chunks raise any detection; 20 trials per cell; `ai-seti be
 
 **Demo:** 1,048,576 channels in **2.4 s wall / 2.3 s CPU on one core** (1.8 s wall on 4
 workers); the three hidden ET-like tones are recovered and rank **#1, #2 and #3**, all
-classified `technosignature_like`, ahead of the strongest RFI (interest 74–82 vs 28–32).
-Classifier: **95.7%** held-out accuracy on 6 classes (simulated; 2500 examples).
+classified `technosignature_like`, ahead of the strongest RFI (interest 72–78 vs 33, with the 2026-10-03 model).
+Classifier: **97.7%** held-out accuracy on 7 classes (simulated; 3,500 examples, 500 per class, drift up to 32 channels/step).
 
 ## How a work unit is processed
 
@@ -475,17 +474,18 @@ run level: isolation-forest anomaly → RFI flags → interest score → report
 - `max_drift_ch_per_step` (default 32) bounds the search. At a GBT coarse channel's
   ~18 s / 2.79 Hz resolution, 4 Hz/s is already ~26 channels per step, so lowering this
   below that number silently throws away signals the rate limit allows.
-- **`drift_search` will not tell you when it could not search the range you asked for.** If
-  the searched drift clamps to zero — a `foff` passed in Hz instead of MHz, a cap below the
-  rate, or a resolution too coarse for the requested drift — it reports *no hits* instead of
-  flagging a degraded run. Absence of detections is not evidence of absence until you have
-  checked the range was searchable. Tracked as [backlog B1/B2](backlog.md).
-- **The classifier is trained on drift of 0.05–6 channels/step but production needs up to
-  ~26.** Its class labels are least reliable in the fast-drift regime the search spends most
-  of its time in, and the published 95.7% accuracy is measured on the training distribution,
-  not on production drift. Tracked as [backlog B3](backlog.md).
-- BL archive API and Range streaming against the real servers were not tested from the
-  development sandbox (network-restricted); Range streaming is tested locally.
+- **A search narrower than asked for is reported, not hidden.** If a work unit is too narrow
+  for the requested drift, `drift_search` logs a warning and `metadata.json` records the drift
+  range actually covered (`drift_searched_hz_s`). A channel width passed in Hz instead of MHz is
+  rejected outright.
+- **The classifier's numbers are measured on simulated data.** It is trained over the whole
+  production drift range (log-uniform up to 32 channels/step) and includes a strong-carrier
+  interference class. Held-out accuracy is 97.7%, and ET-like recall by drift band is 1.00 up to
+  12 channels/step and 0.96 at 12–33 (stored in the model's metadata). Real RFI is still richer
+  than the simulator.
+- Breakthrough Listen archive queries, Range streaming and cadence folders have been run
+  against the real servers (2026-10-03); throughput there is ~7–8 MB/s, so downloads, not
+  analysis, set the pace.
 - GPU (CuPy) path is experimental and untested, and excluded from CI. Multi-core speedup
   was not benchmarked on the development machine, though the multiprocess path is
   exercised by tests and the smoke job.

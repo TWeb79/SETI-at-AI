@@ -27,10 +27,10 @@ DEFAULT_MODEL = Path(__file__).with_name("hit_classifier.joblib")
 
 logger = logging.getLogger(__name__)
 
-# Highest hit SNR in the bundled model's training set (`ai-seti train` defaults: seed 0,
-# 500 per class; reproduced 2026-10-03). Used for models whose metadata predates the
-# recorded "snr_max". Above OOD_SNR_FACTOR x this, the trees only extrapolate flat, so
-# p(technosignature_like) means nothing there (backlog B8).
+# Fallback for models trained before "snr_max" was recorded in their metadata: the highest
+# hit SNR of the pre-2026-10-03 bundled model. Current models carry their own value. Above
+# OOD_SNR_FACTOR x the training maximum the trees only extrapolate flat, so p(...) means
+# nothing there.
 TRAINED_SNR_MAX = 40.24
 OOD_SNR_FACTOR = 3.0
 

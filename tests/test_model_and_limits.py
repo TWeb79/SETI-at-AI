@@ -149,12 +149,12 @@ def test_score_candidates_reports_disabled_ai():
 def test_far_out_of_range_snr_is_not_trusted_as_technosignature():
     """B8: the classifier saturates at p=1 for any strong drifting carrier."""
     rows = pd.concat([_hit_frame("x")] * 2, ignore_index=True)
-    rows["snr"] = [20.0, 10_000.0]
+    rows["snr"] = [20.0, 100_000.0]
     rows["channel"] = [5, 900]
     for label in LABELS:
         rows[f"p_{label}"] = 1.0 if label == "technosignature_like" else 0.0
     cands = score_candidates([{"hits": rows.to_dict("records")}], SearchConfig())
-    strong = cands[cands["snr"] == 10_000.0].iloc[0]
+    strong = cands[cands["snr"] == 100_000.0].iloc[0]
     normal = cands[cands["snr"] == 20.0].iloc[0]
     assert strong["ai_class"] == "out_of_distribution" and strong["interest"] <= 50
     assert strong["interest"] <= 30, "B28: demoted like a stationary tone, not just capped"
@@ -323,7 +323,7 @@ def test_partial_range_units_are_padded_beyond_the_range_edges():
 def test_far_out_of_range_snr_is_capped_without_a_classifier():
     """B8 review: the heuristic fallback trusted a SNR-10,000 carrier just as blindly."""
     rows = _hit_frame("x")
-    rows["snr"] = 10_000.0
+    rows["snr"] = 100_000.0
     cands = score_candidates([{"hits": rows.to_dict("records")}], SearchConfig(use_ai=False))
     assert cands.iloc[0]["interest"] <= 50
 

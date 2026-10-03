@@ -112,7 +112,7 @@ AI-SETI is a local CLI. There is no server, no database and no always-on daemon.
 | Server ignores `Range` | `RangeNotSupported` → the source falls back to a size-guarded download |
 | Classifier will not load | logged, `model_unavailable`, heuristic fallback, `ai_note` in metadata |
 | Ledger write | unique per-PID temp file then `os.replace`, so a partial file is never published |
-| Searched drift range collapses to zero | **not handled.** `drift_search` clamps `k_max` silently, so an unsearchable drift rate yields "no hits" rather than a degraded run. See [backlog.md](backlog.md) B1/B2. |
+| Searched drift range narrower than requested | `drift_search` logs a warning naming the rate it could reach; `metadata.json` records `drift_searched_hz_s`; a channel width given in Hz instead of MHz raises `ValueError`. |
 | Reported drift exceeds the ceiling | `drift_search` skips tree rows past `max_drift_rate_hz_s`, so a reported rate is always inside the configured range. |
 | Server stops sending a Range body | `remote_header` stops on lack of progress, bounded by `max_requests`, and raises `ValueError` naming the URL |
 

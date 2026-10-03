@@ -88,8 +88,8 @@ def normal() -> None:
                 "Why it is not ET:",
                 "- a vertical line: it does not drift, so it",
                 "  moves with the telescope -> it is on Earth",
-                f"- far stronger (SNR {h.snr:,.0f}) than anything the",
-                "  AI was trained on",
+                f"- bright (SNR {h.snr:,.0f}) and perfectly steady: the AI",
+                "  knows it as a strong terrestrial carrier",
                 "- the same frequency also appeared while",
                 "  pointing at another star (HIP3249)"],
             OUT / "signal_normal.png", "#8a8a8a")
